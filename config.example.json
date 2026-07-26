@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to config.json. hardcoded_key is the ONE value not derivable from the machine — a 16/24/32-byte AES key baked into KakaoTalk.exe. Provide as hex or base64. user_id is optional (brute-forced if omitted).",
+  "hardcoded_key": "",
+  "user_id": null,
+  "brute_min": 1000000,
+  "brute_max": 5000000000
+}
