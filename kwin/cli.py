@@ -903,6 +903,72 @@ def cmd_v2sync(args):
     cmd_v2collect(args)
 
 
+def cmd_v2mirror(args):
+    """Create read-only SQLite snapshot and update VPS mirror."""
+    from . import mirror
+
+    user_dir = _active_user_dir(args)
+    db_path = getattr(args, "db", None) or os.path.join(
+        OUT_ROOT, os.path.basename(user_dir), "messages_v2.sqlite"
+    )
+    if not os.path.exists(db_path):
+        sys.exit("Source messages_v2.sqlite not found. Run `v2sync` first.")
+
+    out_user_dir = os.path.join(OUT_ROOT, os.path.basename(user_dir))
+    snapshot_dir = os.path.join(out_user_dir, "snapshot")
+    state_file = os.path.join(out_user_dir, "mirror_state.json")
+    lock_file = os.path.join(out_user_dir, ".mirror.lock")
+    stop_file = os.path.join(PROJECT_ROOT, "data", "config", "STOP_MIRROR")
+
+    if getattr(args, "disable", False):
+        os.makedirs(os.path.dirname(stop_file), exist_ok=True)
+        with open(stop_file, "w", encoding="utf-8") as f:
+            f.write(f"Disabled at {mirror._now_kst()}\n")
+        print("Mirroring disabled.")
+        return
+
+    if getattr(args, "enable", False):
+        if os.path.exists(stop_file):
+            os.unlink(stop_file)
+            print("Mirroring enabled.")
+        else:
+            print("Mirroring already enabled.")
+        return
+
+    vps_target = getattr(args, "vps_target", None) or os.environ.get("KAKAO_VPS_TARGET")
+    vps_dir = getattr(args, "vps_dir", None) or os.environ.get("KAKAO_VPS_DIR")
+    ssh_key = getattr(args, "ssh_key", None) or os.environ.get("KAKAO_VPS_KEY")
+    ssh_port = getattr(args, "ssh_port", None) or (
+        int(os.environ["KAKAO_VPS_PORT"]) if os.environ.get("KAKAO_VPS_PORT") else None
+    )
+    vps_uid = getattr(args, "vps_uid", None)
+    vps_gid = getattr(args, "vps_gid", None)
+
+    try:
+        res = mirror.sync_mirror(
+            src_db=db_path,
+            snapshot_dir=snapshot_dir,
+            state_file=state_file,
+            lock_file=lock_file,
+            stop_file=stop_file,
+            vps_ssh_target=vps_target,
+            vps_remote_dir=vps_dir,
+            vps_uid=vps_uid,
+            vps_gid=vps_gid,
+            ssh_key_path=ssh_key,
+            ssh_port=ssh_port,
+            upload_only=getattr(args, "upload_only", False),
+        )
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+    except mirror.MirrorPipelineError as exc:
+        print(json.dumps({
+            "status": "FAILED",
+            "lastStage": exc.stage,
+            "errorCode": exc.error_code,
+        }, ensure_ascii=False, indent=2))
+        sys.exit(1)
+
+
 def _resolve(args, cfg) -> Solution:
     if cfg.has_derived:
         return Solution("from-memory", "", cfg.user_id or "", cfg.derived_key, cfg.derived_iv)
@@ -1140,6 +1206,7 @@ def main(argv=None):
                      ("v2members", cmd_v2members),
                      ("v2all", cmd_v2all),
                      ("v2sync", cmd_v2sync),
+                     ("v2mirror", cmd_v2mirror),
                      ("probe", cmd_probe), ("brute", cmd_brute),
                      ("extractkey", cmd_extractkey),
                      ("recover", cmd_recover),
@@ -1203,6 +1270,17 @@ def main(argv=None):
                             help="print full raw keys to console")
         if name == "v2sync":
             sp.add_argument("--keys", default=None)
+        if name == "v2mirror":
+            sp.add_argument("--db", default=None, help="path to source messages_v2.sqlite")
+            sp.add_argument("--vps-target", default=None, help="SSH target (user@host)")
+            sp.add_argument("--vps-dir", default=None, help="remote VPS directory for mirror")
+            sp.add_argument("--vps-uid", default=None, help="target VPS owner UID (default: 10000)")
+            sp.add_argument("--vps-gid", default=None, help="target VPS owner GID (default: 10000)")
+            sp.add_argument("--ssh-key", default=None, help="path to SSH private key")
+            sp.add_argument("--ssh-port", type=int, default=None, help="SSH port")
+            sp.add_argument("--upload-only", action="store_true", help="run mirror sync without pre-decrypt")
+            sp.add_argument("--disable", action="store_true", help="disable automatic mirroring via STOP marker")
+            sp.add_argument("--enable", action="store_true", help="enable automatic mirroring by removing STOP marker")
         if name == "extractkey":
             sp.add_argument("--step", type=int, default=8)
             sp.add_argument(

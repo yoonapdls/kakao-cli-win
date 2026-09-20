@@ -10,6 +10,7 @@ docs/
 privacy-audit-share/
 remote-empty-verification/
 kakao-cli-windows-private-data-*/
+v2_decrypted/
 config.json
 v2_keys.json
 memory_inspection.txt
@@ -22,6 +23,8 @@ userid_result.txt
 *.sqlite
 *.sqlite3
 *.sqlite-*
+*.wal
+*.shm
 *.log
 *.jsonl
 *.key

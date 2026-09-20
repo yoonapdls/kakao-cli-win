@@ -27,6 +27,10 @@ from typing import Any, Dict, List, Optional
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from kwin.collect import classify_room_type
+
 DATA_DIR = Path(os.environ.get("KAKAO_WIN_DATA", PROJECT_ROOT / "data"))
 CONFIG_DIR = DATA_DIR / "config"
 OUT_ROOT = Path(os.environ.get("KAKAO_WIN_OUT", DATA_DIR / "output"))
@@ -216,6 +220,7 @@ def list_rooms(q: str = "", limit: int = 300) -> Dict[str, Any]:
     con = _connect(db_path)
     try:
         has_rooms = _has_table(con, "rooms")
+        room_cols = {r[1] for r in con.execute("PRAGMA table_info(rooms)").fetchall()} if has_rooms else set()
         where = ""
         params: List[Any] = []
         if q:
@@ -232,10 +237,12 @@ def list_rooms(q: str = "", limit: int = 300) -> Dict[str, Any]:
             else "'chatId:' || r.chatId"
         )
         room_join = "LEFT JOIN rooms room ON room.chatId = r.chatId" if has_rooms else ""
+        open_expr = "room.isOpenChat" if "isOpenChat" in room_cols else "NULL AS isOpenChat"
+        cat_expr = "room.roomCategory" if "roomCategory" in room_cols else "NULL AS roomCategory"
         room_fields = (
-            "room.type AS roomType, room.activeMembersCount, room.titleSource, room.lastChatMessage"
+            f"room.type AS roomType, {open_expr}, {cat_expr}, room.activeMembersCount, room.titleSource, room.lastChatMessage"
             if has_rooms
-            else "NULL AS roomType, NULL AS activeMembersCount, NULL AS titleSource, NULL AS lastChatMessage"
+            else "NULL AS roomType, NULL AS isOpenChat, NULL AS roomCategory, NULL AS activeMembersCount, NULL AS titleSource, NULL AS lastChatMessage"
         )
         sql = f"""
             WITH r AS (
@@ -276,11 +283,25 @@ def list_rooms(q: str = "", limit: int = 300) -> Dict[str, Any]:
         params.append(limit)
         rooms = []
         for row in con.execute(sql, params):
+            raw_room_type = row["roomType"]
+            is_open = row["isOpenChat"]
+            room_cat = row["roomCategory"]
+            if (is_open is None or room_cat is None) and raw_room_type:
+                calc_open, calc_cat = classify_room_type(raw_room_type)
+                if is_open is None:
+                    is_open = calc_open
+                if room_cat is None:
+                    room_cat = calc_cat
+            if room_cat is None:
+                room_cat = "unknown"
+
             rooms.append(
                 {
                     "chatId": str(row["chatId"]),
                     "title": _clean_text(row["title"]),
-                    "roomType": row["roomType"],
+                    "roomType": raw_room_type,
+                    "isOpenChat": is_open,
+                    "roomCategory": room_cat,
                     "activeMembersCount": row["activeMembersCount"],
                     "titleSource": row["titleSource"],
                     "messageCount": row["messageCount"],
@@ -305,22 +326,49 @@ def list_rooms(q: str = "", limit: int = 300) -> Dict[str, Any]:
 
 def _room_meta(con: sqlite3.Connection, chat_id: str) -> Dict[str, Any]:
     if not _has_table(con, "rooms"):
-        return {"chatId": str(chat_id), "title": f"chatId:{chat_id}"}
+        return {
+            "chatId": str(chat_id),
+            "title": f"chatId:{chat_id}",
+            "isOpenChat": None,
+            "roomCategory": "unknown",
+        }
+    cols = {r[1] for r in con.execute("PRAGMA table_info(rooms)").fetchall()}
+    col_open = "isOpenChat" if "isOpenChat" in cols else "NULL AS isOpenChat"
+    col_cat = "roomCategory" if "roomCategory" in cols else "NULL AS roomCategory"
     row = con.execute(
-        """SELECT chatId, title, titleSource, type, activeMembersCount,
+        f"""SELECT chatId, title, titleSource, type, activeMembersCount,
                   useCustomChatRoomTitle, directChatMemberId, lastUpdatedAt,
-                  lastChatMessage
+                  lastChatMessage, {col_open}, {col_cat}
              FROM rooms
             WHERE chatId = ?""",
         (chat_id,),
     ).fetchone()
     if not row:
-        return {"chatId": str(chat_id), "title": f"chatId:{chat_id}"}
+        return {
+            "chatId": str(chat_id),
+            "title": f"chatId:{chat_id}",
+            "isOpenChat": None,
+            "roomCategory": "unknown",
+        }
+    raw_type = row["type"]
+    is_open = row["isOpenChat"]
+    room_cat = row["roomCategory"]
+    if (is_open is None or room_cat is None) and raw_type:
+        calc_open, calc_cat = classify_room_type(raw_type)
+        if is_open is None:
+            is_open = calc_open
+        if room_cat is None:
+            room_cat = calc_cat
+    if room_cat is None:
+        room_cat = "unknown"
+
     return {
         "chatId": str(row["chatId"]),
         "title": _clean_text(row["title"]),
         "titleSource": row["titleSource"],
-        "roomType": row["type"],
+        "roomType": raw_type,
+        "isOpenChat": is_open,
+        "roomCategory": room_cat,
         "activeMembersCount": row["activeMembersCount"],
         "useCustomChatRoomTitle": row["useCustomChatRoomTitle"],
         "directChatMemberId": str(row["directChatMemberId"]) if row["directChatMemberId"] is not None else "",
@@ -328,6 +376,23 @@ def _room_meta(con: sqlite3.Connection, chat_id: str) -> Dict[str, Any]:
         "lastUpdatedAtKst": _kst(row["lastUpdatedAt"]),
         "lastChatMessage": _clean_text(row["lastChatMessage"]),
     }
+
+
+def get_room(chat_id: str) -> Dict[str, Any]:
+    db_path = _find_default_db()
+    if not db_path:
+        raise RuntimeError("messages_v2.sqlite not found. Run sync after recovering keys.")
+    con = _connect(db_path)
+    try:
+        meta = _room_meta(con, chat_id)
+        return {
+            "db": str(db_path),
+            "dbUpdatedKst": _file_mtime_kst(db_path),
+            "room": meta,
+            **meta,
+        }
+    finally:
+        con.close()
 
 
 def _message_filters(chat_id: str, qs: Dict[str, List[str]]) -> tuple[str, List[Any]]:
@@ -718,6 +783,9 @@ class Handler(BaseHTTPRequestHandler):
                 q = qs.get("q", [""])[0]
                 limit = min(max(int(qs.get("limit", ["300"])[0]), 1), 1000)
                 self._json(list_rooms(q, limit))
+                return
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "rooms":
+                self._json(get_room(parts[2]))
                 return
             if len(parts) == 4 and parts[0] == "api" and parts[1] == "rooms" and parts[3] == "messages":
                 self._json(list_messages(parts[2], qs))
