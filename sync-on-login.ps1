@@ -47,6 +47,16 @@ function Write-AtomicJson {
         } else {
             Move-Item -LiteralPath $tmp -Destination $FilePath -Force
         }
+        if ((-not $RootDirectory) -and $PSScriptRoot -and (-not $FilePath.StartsWith($PSScriptRoot, [System.StringComparison]::OrdinalIgnoreCase))) {
+            try {
+                $localRel = if ($FilePath -match '(?i)[\\/]state[\\/]([^\\/]+)$') { Join-Path $PSScriptRoot ("data\state\" + $matches[1]) } else { $null }
+                if ($localRel) {
+                    $ldir = Split-Path -Parent $localRel
+                    if (-not (Test-Path -LiteralPath $ldir)) { New-Item -ItemType Directory -Force -Path $ldir | Out-Null }
+                    [System.IO.File]::WriteAllText($localRel, $json, $utf8NoBom)
+                }
+            } catch {}
+        }
     } finally {
         if (Test-Path -LiteralPath $tmp) {
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
@@ -85,10 +95,31 @@ function Get-SafeErrorCode {
         'HTTP_500',
         'HTTP_502',
         'HTTP_503',
-        'HTTP_504'
+        'HTTP_504',
+        'DIR_PREPARE_FAILED',
+        'UPLOAD_FAILED',
+        'VERIFY_FAILED',
+        'VERIFY_COMMAND_FAILED',
+        'DOWNLOAD_FAILED',
+        'PARSE_ERROR',
+        'INTEGRITY_FAILED',
+        'COUNT_MISMATCH',
+        'MIN_TIMESTAMP_MISMATCH',
+        'MAX_TIMESTAMP_MISMATCH',
+        'HASH_MISMATCH',
+        'SIZE_MISMATCH',
+        'CLEANUP_FAILED',
+        'REPLACE_FAILED',
+        'INVALID_PARAM',
+        'FILE_NOT_FOUND',
+        'MIRROR_FAILED',
+        'SYNC_FAILED'
     )
     if ($known -contains $msg) {
         return $msg
+    }
+    if ($msg -eq 'CONNECT_FAILED') {
+        return 'CONNECTION_FAILED'
     }
 
     if ($ex -is [System.Net.WebException]) {
@@ -130,10 +161,10 @@ function Get-SafeErrorCode {
         $curr = $curr.InnerException
     }
 
-    if ($msg -match '초과|timed?\s*out|timeout') {
+    if ($msg -match '(?i)timed?\s*out|timeout|\uCD08\uACFC') {
         return 'TIMEOUT'
     }
-    if ($msg -match '연결|connect|refused|거부') {
+    if ($msg -match '(?i)connect|refused|\uC5F0\uACB0|\uAC70\uBD80') {
         return 'CONNECTION_FAILED'
     }
     if ($msg -match '503|busy|running') {
@@ -320,6 +351,17 @@ try {
 
     $now = Get-Date
     $elapsedSync = if ($sw) { [math]::Round($sw.Elapsed.TotalSeconds, 2) } else { 0 }
+    $localRecord = [ordered]@{
+        status = 'SUCCESS'
+        ready = [bool]$after.ready
+        messages_before = [int64]$before.counts.messages
+        messages_after = [int64]$after.counts.messages
+        db_updated_kst = [string]$after.dbUpdatedKst
+        elapsed_seconds = $elapsedSync
+    }
+    $mirrorRecord = [ordered]@{
+        status = if ($SkipMirror) { 'SKIPPED' } else { 'PENDING' }
+    }
     $record = [ordered]@{
         status = 'SUCCESS'
         stage = 'COMPLETE'
@@ -331,10 +373,13 @@ try {
         messages_before = [int64]$before.counts.messages
         messages_after = [int64]$after.counts.messages
         db_updated_kst = [string]$after.dbUpdatedKst
+        local = $localRecord
+        mirror = $mirrorRecord
     }
     Write-AtomicJson -FilePath $dst -Data $record
 
     if (-not $SkipMirror) {
+        $stage = 'mirror'
 # >>> kakao-post-sync-mirror >>>
 # Post-sync mirror trigger: fail-closed, executes only when sync succeeded and marker is current
 $__can_run_mirror = $false
@@ -425,12 +470,177 @@ try {
 
 if ($__can_run_mirror) {
     Write-Host "[post-sync-mirror-hook] Triggering post-sync mirror (-UploadOnly)..."
-    $__mirror_runner = "D:\kakao\kakao-cli-win\post-sync-mirror.ps1"
-    if (Test-Path -LiteralPath $__mirror_runner) {
-        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$__mirror_runner" -UploadOnly
+    $__mirror_runner = $null
+    $__runner_candidates = @()
+    if (Test-Path variable:root) { $__runner_candidates += (Join-Path $root "post-sync-mirror.ps1") }
+    if (Test-Path variable:PSScriptRoot) { $__runner_candidates += (Join-Path $PSScriptRoot "post-sync-mirror.ps1") }
+    $__runner_candidates += "D:\kakao\kakao-cli-win\post-sync-mirror.ps1"
+    foreach ($__cand in $__runner_candidates) {
+        if ($__cand -and (Test-Path -LiteralPath $__cand)) {
+            $__mirror_runner = $__cand
+            break
+        }
+    }
+
+    if ($__mirror_runner) {
+        $__prev_ea = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $env:KAKAO_CALLER_SYNC = "1"
+            $__mirror_output = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$__mirror_runner" -UploadOnly 2>&1
+            $__mirror_exit = $LASTEXITCODE
+        } finally {
+            Remove-Item env:KAKAO_CALLER_SYNC -ErrorAction SilentlyContinue
+            $ErrorActionPreference = $__prev_ea
+        }
+        $__mirror_output | ForEach-Object { Write-Host $_ }
+
+        $__mstate = $null
+        $__has_fresh_state = $false
+        $__state_candidates = @()
+        if (Test-Path variable:root) { $__state_candidates += (Join-Path $root "output") }
+        if (Test-Path variable:PSScriptRoot) { $__state_candidates += (Join-Path $PSScriptRoot "data\output") }
+        $__state_candidates += "D:\kakao\kakao-cli-win\data\output"
+        foreach ($__sc in $__state_candidates) {
+            if ($__sc -and (Test-Path -LiteralPath $__sc)) {
+                $__sfiles = Get-ChildItem -Path $__sc -Filter "mirror_state.json" -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+                if ($__sfiles -and $__sfiles.Count -gt 0) {
+                    $__cand_file = $__sfiles[0]
+                    $__is_recent = ($__cand_file.LastWriteTime -ge $started.AddSeconds(-60))
+                    if ($__is_recent) {
+                        try {
+                            $__parsed = Get-Content -LiteralPath $__cand_file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+                            if ($__mirror_exit -ne 0) {
+                                if ($__parsed -and $__parsed.status -ne 'SUCCESS' -and $__parsed.lastStage -ne 'COMPLETE') {
+                                    $__mstate = $__parsed
+                                    $__has_fresh_state = $true
+                                    break
+                                }
+                            } else {
+                                if ($__parsed -and ($__parsed.status -eq 'SUCCESS' -or $__parsed.status -eq 'SNAPSHOT_CREATED')) {
+                                    $__mstate = $__parsed
+                                    $__has_fresh_state = $true
+                                    break
+                                }
+                            }
+                        } catch {}
+                    }
+                }
+            }
+        }
+
+        if ($__mirror_exit -ne 0) {
+            $__m_stage = if ($__has_fresh_state -and $__mstate -and $__mstate.lastStage -and $__mstate.lastStage -ne 'COMPLETE') {
+                [string]$__mstate.lastStage
+            } else {
+                'mirror'
+            }
+            $__cand_err = if ($__has_fresh_state -and $__mstate -and $__mstate.errorCode) {
+                [string]$__mstate.errorCode
+            } else {
+                'MIRROR_FAILED'
+            }
+            $__safe_err = Get-SafeErrorCode -ErrorItem $__cand_err
+            if ($__safe_err -eq 'SYNC_FAILED' -or [string]::IsNullOrEmpty($__safe_err)) {
+                $__safe_err = 'MIRROR_FAILED'
+            }
+
+            $now = Get-Date
+            $diagFile = Join-Path $logDir ("mirror-diag-{0}.jsonl" -f ($now.ToString('yyyy-MM-dd')))
+            $diagRecord = [ordered]@{
+                timestamp = $now.ToString('o')
+                child_exit_code = [int]$__mirror_exit
+                exit_code = [int]$__mirror_exit
+                fresh_state = [bool]$__has_fresh_state
+                has_fresh_state = [bool]$__has_fresh_state
+                lastStage = [string]$__m_stage
+                last_stage = [string]$__m_stage
+                stage = [string]$__m_stage
+                errorCode = [string]$__safe_err
+                error_code = [string]$__safe_err
+            }
+            $diagJson = $diagRecord | ConvertTo-Json -Compress
+            [System.IO.File]::AppendAllText($diagFile, $diagJson + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+            if ((-not $RootDirectory) -and $PSScriptRoot -and (-not $diagFile.StartsWith($PSScriptRoot, [System.StringComparison]::OrdinalIgnoreCase))) {
+                try {
+                    $localDiag = Join-Path $PSScriptRoot ("data\logs\" + (Split-Path -Leaf $diagFile))
+                    $ldir = Split-Path -Parent $localDiag
+                    if (-not (Test-Path -LiteralPath $ldir)) { New-Item -ItemType Directory -Force -Path $ldir | Out-Null }
+                    [System.IO.File]::AppendAllText($localDiag, $diagJson + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+                } catch {}
+            }
+
+            $stage = $__m_stage
+            throw $__safe_err
+        } else {
+            $now = Get-Date
+            $diagFile = Join-Path $logDir ("mirror-diag-{0}.jsonl" -f ($now.ToString('yyyy-MM-dd')))
+            $diagRecord = [ordered]@{
+                timestamp = $now.ToString('o')
+                child_exit_code = 0
+                exit_code = 0
+                fresh_state = [bool]$__has_fresh_state
+                has_fresh_state = [bool]$__has_fresh_state
+                lastStage = 'COMPLETE'
+                last_stage = 'COMPLETE'
+                stage = 'COMPLETE'
+                errorCode = $null
+                error_code = $null
+            }
+            $diagJson = $diagRecord | ConvertTo-Json -Compress
+            [System.IO.File]::AppendAllText($diagFile, $diagJson + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+            if ((-not $RootDirectory) -and $PSScriptRoot -and (-not $diagFile.StartsWith($PSScriptRoot, [System.StringComparison]::OrdinalIgnoreCase))) {
+                try {
+                    $localDiag = Join-Path $PSScriptRoot ("data\logs\" + (Split-Path -Leaf $diagFile))
+                    $ldir = Split-Path -Parent $localDiag
+                    if (-not (Test-Path -LiteralPath $ldir)) { New-Item -ItemType Directory -Force -Path $ldir | Out-Null }
+                    [System.IO.File]::AppendAllText($localDiag, $diagJson + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+                } catch {}
+            }
+
+            $elapsedTotal = [math]::Round(($now - $started).TotalSeconds, 2)
+            $record.completed_at = $now.ToString('o')
+            $record.elapsed_seconds = $elapsedTotal
+            if ($__mstate -and $__mstate.status -eq 'SUCCESS' -and $__mstate.remoteMirror) {
+                $record.mirror = [ordered]@{
+                    status = 'SUCCESS'
+                    stage = 'COMPLETE'
+                    count = [int64]$__mstate.remoteMirror.messageCount
+                    messageCount = [int64]$__mstate.remoteMirror.messageCount
+                    minSentAtIso = $__mstate.remoteMirror.minSentAtIso
+                    maxSentAtIso = $__mstate.remoteMirror.maxSentAtIso
+                    sha256 = [string]$__mstate.remoteMirror.sha256
+                    sizeBytes = if ($__mstate.remoteMirror.sizeBytes) { [int64]$__mstate.remoteMirror.sizeBytes } elseif ($__mstate.localSnapshot.sizeBytes) { [int64]$__mstate.localSnapshot.sizeBytes } else { $null }
+                    integrity = if ($__mstate.remoteMirror.integrityCheck) { [string]$__mstate.remoteMirror.integrityCheck } else { 'ok' }
+                }
+            } elseif ($__mstate -and $__mstate.status -eq 'SNAPSHOT_CREATED') {
+                $record.mirror = [ordered]@{
+                    status = 'SNAPSHOT_CREATED'
+                    stage = 'COMPLETE'
+                    count = [int64]$__mstate.localSnapshot.messageCount
+                    messageCount = [int64]$__mstate.localSnapshot.messageCount
+                    minSentAtIso = $__mstate.localSnapshot.minSentAtIso
+                    maxSentAtIso = $__mstate.localSnapshot.maxSentAtIso
+                    sha256 = [string]$__mstate.localSnapshot.sha256
+                    sizeBytes = [int64]$__mstate.localSnapshot.sizeBytes
+                    integrity = if ($__mstate.localSnapshot.integrityCheck) { [string]$__mstate.localSnapshot.integrityCheck } else { 'ok' }
+                }
+            } else {
+                $record.mirror = [ordered]@{
+                    status = 'SUCCESS'
+                }
+            }
+            Write-AtomicJson -FilePath $dst -Data $record
+        }
     }
 } else {
     Write-Host "[post-sync-mirror-hook] Skipped: $__skip_reason"
+    if ($record -and $record.mirror -and $record.mirror.status -eq 'PENDING') {
+        $record.mirror = [ordered]@{
+            status = 'SKIPPED'
+        }
+        Write-AtomicJson -FilePath $dst -Data $record
+    }
 }
 # <<< kakao-post-sync-mirror <<<
     }
@@ -445,6 +655,14 @@ catch {
     $elapsedTotal = [math]::Round(($now - $started).TotalSeconds, 2)
     $safeError = Get-SafeErrorCode -ErrorItem $_
 
+    $isMirrorErr = ($syncSuccess -eq $true -or $stage -like 'mirror*' -or $stage -like 'REMOTE_*' -or $stage -in @('INIT', 'DIR_PREPARE', 'SNAPSHOT', 'UPLOAD', 'REPLACE', 'CLEANUP'))
+    if ($isMirrorErr -and ($safeError -eq 'SYNC_FAILED' -or [string]::IsNullOrEmpty($safeError))) {
+        $safeError = 'MIRROR_FAILED'
+    }
+
+    $localStatus = if ($isMirrorErr) { 'SUCCESS' } else { 'FAILED' }
+    $mirrorStatus = if ($isMirrorErr) { 'FAILED' } else { 'SKIPPED' }
+
     $record = [ordered]@{
         status = 'FAILED'
         stage = $stage
@@ -454,6 +672,20 @@ catch {
         completed_at = $now.ToString('o')
         elapsed_seconds = $elapsedTotal
         attempts = [math]::Max(1, $attempt)
+        local = [ordered]@{
+            status = $localStatus
+            stage = if ($localStatus -eq 'SUCCESS') { 'COMPLETE' } else { $stage }
+            error = if ($localStatus -eq 'SUCCESS') { $null } else { $safeError }
+            error_code = if ($localStatus -eq 'SUCCESS') { $null } else { $safeError }
+            messages_before = if ($before -and $before.counts) { [int64]$before.counts.messages } else { 0 }
+            messages_after = if ($after -and $after.counts) { [int64]$after.counts.messages } else { 0 }
+        }
+        mirror = [ordered]@{
+            status = $mirrorStatus
+            stage = if ($mirrorStatus -eq 'FAILED') { $stage } else { $null }
+            error = if ($mirrorStatus -eq 'FAILED') { $safeError } else { $null }
+            error_code = if ($mirrorStatus -eq 'FAILED') { $safeError } else { $null }
+        }
     }
     Write-AtomicJson -FilePath $dst -Data $record
 

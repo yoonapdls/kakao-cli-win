@@ -1973,5 +1973,211 @@ Write-Host "Sync completed successfully"
         self.assertEqual(called_kwargs.get("vps_gid"), 54321)
 
 
+    def test_windows_and_remote_temp_files_cleaned_up_in_finally_on_success_and_failure(self):
+        """Verify Windows plaintext snapshot and verification temp files are cleaned up in finally on both success and failure."""
+        snap_path = self.snapshot_dir / "messages_v2_snapshot.sqlite"
+
+        def mock_upload(scp_cmd, local_p, remote_dst):
+            return 0, "", ""
+
+        def mock_download_success(scp_cmd, remote_src, local_dest):
+            # snap_path must exist while pipeline is executing
+            self.assertTrue(snap_path.exists(), "Snapshot must exist during transfer/verify")
+            actual_sha = mirror.compute_sha256(snap_path)
+            actual_sz = snap_path.stat().st_size
+            content = json.dumps({
+                "integrityCheck": "ok",
+                "messageCount": 3,
+                "minSentAtIso": "2023-11-14T22:13:20",
+                "maxSentAtIso": "2023-11-14T22:13:40",
+                "sha256": actual_sha,
+                "sizeBytes": actual_sz,
+            })
+            Path(local_dest).write_text(content, encoding="utf-8")
+            return 0, "", ""
+
+        # Case 1: Success cleans up Windows plaintext snapshot
+        res = mirror.sync_mirror(
+            src_db=self.src_db,
+            snapshot_dir=self.snapshot_dir,
+            state_file=self.state_file,
+            lock_file=self.lock_file,
+            stop_file=self.stop_file,
+            vps_ssh_target="user@test.vps",
+            vps_remote_dir="/var/data/kakao",
+            ssh_runner=lambda c, r, timeout=None: (0, "", ""),
+            upload_runner=mock_upload,
+            download_runner=mock_download_success,
+        )
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertFalse(snap_path.exists(), "Windows plaintext snapshot must be deleted in finally on success")
+        # Ensure no temp verification files remain
+        leftover_tmps = list(self.snapshot_dir.glob(".verify_*.tmp"))
+        self.assertEqual(len(leftover_tmps), 0)
+
+        # Case 2: Upload failure cleans up Windows plaintext snapshot
+        def mock_upload_fail(scp_cmd, local_p, remote_dst):
+            return 1, "", "SCP upload failed"
+
+        with self.assertRaises(mirror.MirrorPipelineError):
+            mirror.sync_mirror(
+                src_db=self.src_db,
+                snapshot_dir=self.snapshot_dir,
+                state_file=self.state_file,
+                lock_file=self.lock_file,
+                stop_file=self.stop_file,
+                vps_ssh_target="user@test.vps",
+                vps_remote_dir="/var/data/kakao",
+                ssh_runner=lambda c, r, timeout=None: (0, "", ""),
+                upload_runner=mock_upload_fail,
+            )
+        self.assertFalse(snap_path.exists(), "Windows plaintext snapshot must be deleted in finally on failure")
+
+    def test_source_database_immutability(self):
+        """Verify source database is never mutated by mirror sync, and works even when marked read-only on disk."""
+        import stat
+
+        initial_sha = mirror.compute_sha256(self.src_db)
+        initial_size = self.src_db.stat().st_size
+
+        # Mark source file read-only on Windows filesystem
+        os.chmod(self.src_db, stat.S_IREAD)
+        try:
+            def mock_upload(scp_cmd, local_p, remote_dst):
+                return 0, "", ""
+
+            def mock_download(scp_cmd, remote_src, local_dest):
+                actual_sha = mirror.compute_sha256(self.snapshot_dir / "messages_v2_snapshot.sqlite")
+                content = json.dumps({
+                    "integrityCheck": "ok",
+                    "messageCount": 3,
+                    "minSentAtIso": "2023-11-14T22:13:20",
+                    "maxSentAtIso": "2023-11-14T22:13:40",
+                    "sha256": actual_sha,
+                })
+                Path(local_dest).write_text(content, encoding="utf-8")
+                return 0, "", ""
+
+            res = mirror.sync_mirror(
+                src_db=self.src_db,
+                snapshot_dir=self.snapshot_dir,
+                state_file=self.state_file,
+                lock_file=self.lock_file,
+                stop_file=self.stop_file,
+                vps_ssh_target="user@test.vps",
+                vps_remote_dir="/var/data/kakao",
+                ssh_runner=lambda c, r, timeout=None: (0, "", ""),
+                upload_runner=mock_upload,
+                download_runner=mock_download,
+            )
+            self.assertEqual(res["status"], "SUCCESS")
+
+            # Verify source DB was not mutated
+            final_sha = mirror.compute_sha256(self.src_db)
+            final_size = self.src_db.stat().st_size
+            self.assertEqual(initial_sha, final_sha)
+            self.assertEqual(initial_size, final_size)
+        finally:
+            # Restore write permission for cleanup
+            os.chmod(self.src_db, stat.S_IWRITE | stat.S_IREAD)
+
+    def test_remote_verify_size_mismatch_fails_and_cleans_partial(self):
+        """Verify that size mismatch between remote verification and local snapshot triggers SIZE_MISMATCH and cleans partial."""
+        commands_run = []
+
+        def mock_ssh(ssh_cmd, remote_cmd, timeout=None):
+            commands_run.append(remote_cmd)
+            return 0, "", ""
+
+        def mock_upload(scp_cmd, local_p, remote_dst):
+            return 0, "", ""
+
+        def mock_download(scp_cmd, remote_src, local_dest):
+            actual_sha = mirror.compute_sha256(self.snapshot_dir / "messages_v2_snapshot.sqlite")
+            content = json.dumps({
+                "integrityCheck": "ok",
+                "messageCount": 3,
+                "minSentAtIso": "2023-11-14T22:13:20",
+                "maxSentAtIso": "2023-11-14T22:13:40",
+                "sha256": actual_sha,
+                "sizeBytes": 9999999,  # Intentionally mismatched size
+            })
+            Path(local_dest).write_text(content, encoding="utf-8")
+            return 0, "", ""
+
+        with self.assertRaises(mirror.MirrorPipelineError) as ctx:
+            mirror.sync_mirror(
+                src_db=self.src_db,
+                snapshot_dir=self.snapshot_dir,
+                state_file=self.state_file,
+                lock_file=self.lock_file,
+                stop_file=self.stop_file,
+                vps_ssh_target="user@test.vps",
+                vps_remote_dir="/var/data/kakao",
+                ssh_runner=mock_ssh,
+                upload_runner=mock_upload,
+                download_runner=mock_download,
+            )
+
+        self.assertEqual(ctx.exception.stage, "REMOTE_VERIFY")
+        self.assertEqual(ctx.exception.error_code, "SIZE_MISMATCH")
+
+        # Verify partial cleanup was executed
+        self.assertTrue(any("rm -f /var/data/kakao/messages_v2.sqlite.partial" in c for c in commands_run))
+        # Verify atomic replace was NOT executed
+        self.assertFalse(any("mv -f /var/data/kakao/messages_v2.sqlite.partial" in c for c in commands_run))
+
+    def test_remote_replace_preserves_previous_normal_copy_with_mode_600(self):
+        """Verify that atomic replacement preserves previous current DB as messages_v2.sqlite.prev with mode 600 and UID:GID."""
+        commands_run = []
+
+        def mock_ssh(ssh_cmd, remote_cmd, timeout=None):
+            commands_run.append(remote_cmd)
+            return 0, "", ""
+
+        def mock_upload(scp_cmd, local_p, remote_dst):
+            return 0, "", ""
+
+        def mock_download(scp_cmd, remote_src, local_dest):
+            actual_sha = mirror.compute_sha256(self.snapshot_dir / "messages_v2_snapshot.sqlite")
+            actual_sz = (self.snapshot_dir / "messages_v2_snapshot.sqlite").stat().st_size
+            content = json.dumps({
+                "integrityCheck": "ok",
+                "messageCount": 3,
+                "minSentAtIso": "2023-11-14T22:13:20",
+                "maxSentAtIso": "2023-11-14T22:13:40",
+                "sha256": actual_sha,
+                "sizeBytes": actual_sz,
+            })
+            Path(local_dest).write_text(content, encoding="utf-8")
+            return 0, "", ""
+
+        res = mirror.sync_mirror(
+            src_db=self.src_db,
+            snapshot_dir=self.snapshot_dir,
+            state_file=self.state_file,
+            lock_file=self.lock_file,
+            stop_file=self.stop_file,
+            vps_ssh_target="user@test.vps",
+            vps_remote_dir="/var/data/kakao",
+            vps_uid=10000,
+            vps_gid=10000,
+            ssh_runner=mock_ssh,
+            upload_runner=mock_upload,
+            download_runner=mock_download,
+        )
+
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertTrue(res["remoteMirror"].get("previousBackupPreserved"))
+
+        # Inspect replace command
+        replace_cmds = [c for c in commands_run if "had_cur" in c]
+        self.assertTrue(len(replace_cmds) >= 1)
+        rep = replace_cmds[0]
+        self.assertIn("messages_v2.sqlite.prev", rep, "Replace script must preserve previous copy as .prev")
+        self.assertIn("10000:10000", rep)
+        self.assertIn("600", rep)
+
+
 if __name__ == "__main__":
     unittest.main()

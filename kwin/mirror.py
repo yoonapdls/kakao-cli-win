@@ -85,12 +85,14 @@ REMOTE_VERIFY_SCRIPT = (
     "                break\n"
     "            h.update(chunk)\n"
     "    sha = h.hexdigest()\n"
+    "    sz = os.path.getsize(db_path)\n"
     "    data = {\n"
     "        'integrityCheck': integrity,\n"
     "        'messageCount': cnt,\n"
     "        'minSentAtIso': min_iso,\n"
     "        'maxSentAtIso': max_iso,\n"
     "        'sha256': sha,\n"
+    "        'sizeBytes': sz,\n"
     "    }\n"
     "    fd = os.open(meta_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)\n"
     "    with open(fd, 'w', encoding='utf-8') as f:\n"
@@ -641,6 +643,13 @@ def parse_remote_meta(content: str) -> Dict[str, Any]:
             min_iso = data.get("minSentAtIso")
             max_iso = data.get("maxSentAtIso")
             sha = data.get("sha256")
+            size_raw = data.get("sizeBytes")
+            size_val = None
+            if size_raw is not None:
+                try:
+                    size_val = int(size_raw)
+                except (ValueError, TypeError):
+                    size_val = None
 
             if not isinstance(integrity, str) or not isinstance(sha, str) or count_raw is None:
                 raise ValueError("Missing or invalid required fields in JSON metadata")
@@ -657,6 +666,7 @@ def parse_remote_meta(content: str) -> Dict[str, Any]:
                 "minSentAtIso": str(min_iso).strip() if min_iso is not None else None,
                 "maxSentAtIso": str(max_iso).strip() if max_iso is not None else None,
                 "sha256": sha_clean,
+                "sizeBytes": size_val,
             }
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
             raise ValueError(f"Failed to parse JSON metadata: {exc}") from exc
@@ -747,6 +757,8 @@ def sync_mirror(
     state = StateMarker(state_file)
     state.update(status="IN_PROGRESS", lastStage="INIT", lastAttemptKst=_now_kst())
     current_stage = "INIT"
+    snapshot_file: Optional[Path] = None
+    local_meta_file: Optional[Path] = None
 
     try:
         src_path = Path(src_db).resolve()
@@ -974,6 +986,13 @@ def sync_mirror(
             _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_VERIFY", "MAX_TIMESTAMP_MISMATCH")
 
+        # Compare size if available
+        remote_size = parsed_meta.get("sizeBytes")
+        if remote_size is not None and snap_meta.get("sizeBytes") is not None:
+            if remote_size != snap_meta["sizeBytes"]:
+                _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+                raise MirrorPipelineError("REMOTE_VERIFY", "SIZE_MISMATCH")
+
         # Compare SHA-256 hash
         if remote_sha256.lower() != snap_meta["sha256"].lower():
             _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
@@ -1000,10 +1019,13 @@ def sync_mirror(
         rollback_token = secrets.token_hex(16)
         remote_rollback_file = f"{remote_dir}/.messages_v2.rollback_{rollback_token}"
         remote_nocur_file = f"{remote_dir}/.messages_v2.nocur_{rollback_token}"
+        remote_backup_file = f"{remote_dir}/messages_v2.sqlite.prev"
         validate_remote_path(remote_rollback_file)
         validate_remote_path(remote_nocur_file)
+        validate_remote_path(remote_backup_file)
         remote_rollback_q = shlex.quote(remote_rollback_file)
         remote_nocur_q = shlex.quote(remote_nocur_file)
+        remote_backup_q = shlex.quote(remote_backup_file)
 
         def _rollback_remote() -> None:
             r_cmd = (
@@ -1044,7 +1066,14 @@ def sync_mirror(
             f"   chmod 600 {remote_current_q} && "
             f"   [ \"$(stat -c '%u:%g:%a' {remote_current_q})\" = '{uid}:{gid}:600' ] && "
             f"   [ \"$(stat -c '%u:%g:%a' {remote_dir_q})\" = '{uid}:{gid}:700' ]; then "
-            f"  if [ $had_cur -eq 1 ]; then rm -f {remote_rollback_q}; else rm -f {remote_nocur_q}; fi; "
+            f"  if [ $had_cur -eq 1 ]; then "
+            f"    mv -f {remote_rollback_q} {remote_backup_q} && "
+            f"    chown {uid}:{gid} {remote_backup_q} && "
+            f"    chmod 600 {remote_backup_q} && "
+            f"    [ \"$(stat -c '%u:%g:%a' {remote_backup_q})\" = '{uid}:{gid}:600' ] || rm -f {remote_rollback_q}; "
+            f"  else "
+            f"    rm -f {remote_nocur_q}; "
+            f"  fi; "
             f"  exit 0; "
             f"else "
             f"  rm -f {remote_current_q}; "
@@ -1095,6 +1124,8 @@ def sync_mirror(
             "minSentAtIso": remote_min,
             "maxSentAtIso": remote_max,
             "sha256": remote_sha256,
+            "sizeBytes": remote_size if remote_size is not None else snap_meta.get("sizeBytes"),
+            "previousBackupPreserved": True,
             "verifiedAtKst": _now_kst(),
         }
 
@@ -1138,4 +1169,15 @@ def sync_mirror(
         )
         raise MirrorPipelineError(err_stage, err_code) from None
     finally:
+        if vps_ssh_target and vps_remote_dir:
+            if snapshot_file and snapshot_file.exists():
+                try:
+                    snapshot_file.unlink()
+                except OSError:
+                    pass
+        if local_meta_file and local_meta_file.exists():
+            try:
+                local_meta_file.unlink()
+            except OSError:
+                pass
         lock.release()

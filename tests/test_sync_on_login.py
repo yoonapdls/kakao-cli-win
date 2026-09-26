@@ -691,6 +691,351 @@ class TestSyncOnLoginWorker(unittest.TestCase):
         self.assertEqual(res["r503"], "HTTP_503")
         self.assertEqual(res["r504"], "HTTP_504")
 
+    def test_last_sync_marker_local_and_mirror_independent_fields_on_success(self):
+        """Verify that last-sync.json records independent local and mirror structures on success while preserving watcher fields."""
+        def handle_health(req):
+            req.send_response(200)
+            req.send_header("Content-Type", "application/json")
+            req.end_headers()
+            req.wfile.write(b'{"ok": true}')
+
+        def handle_status(req):
+            req.send_response(200)
+            req.send_header("Content-Type", "application/json")
+            req.end_headers()
+            req.wfile.write(b'{"ready": true, "counts": {"messages": 1000}, "dbUpdatedKst": "2026-09-14 10:00:00 KST"}')
+
+        def handle_sync(req):
+            req.send_response(200)
+            req.send_header("Content-Type", "application/json")
+            req.end_headers()
+            req.wfile.write(b'{"ok": true}')
+
+        self.mock_server.register("GET", "/api/health", handle_health)
+        self.mock_server.register("GET", "/api/status", handle_status)
+        self.mock_server.register("POST", "/api/sync", handle_sync)
+
+        proc = self._run_worker()
+        self.assertEqual(proc.returncode, 0, f"Expected 0, got {proc.returncode}. Stderr: {proc.stderr}")
+
+        self.assertTrue(self.state_file.exists())
+        state = json.loads(self.state_file.read_text(encoding="utf-8"))
+
+        # Top-level watcher compatibility fields
+        self.assertEqual(state.get("status"), "SUCCESS")
+        self.assertEqual(state.get("stage"), "COMPLETE")
+        self.assertIn("completed_at", state)
+        self.assertEqual(state.get("messages_after"), 1000)
+
+        # Independent local and mirror structures
+        self.assertIn("local", state)
+        self.assertIsInstance(state["local"], dict)
+        self.assertEqual(state["local"].get("status"), "SUCCESS")
+        self.assertEqual(state["local"].get("messages_after"), 1000)
+
+        self.assertIn("mirror", state)
+        self.assertIsInstance(state["mirror"], dict)
+        self.assertEqual(state["mirror"].get("status"), "SKIPPED")
+
+    def test_last_sync_marker_mirror_failure_marks_overall_failed_and_distinguishes_local_success(self):
+        """Verify that when local sync succeeds but mirror fails:
+        1. Top-level status is FAILED (never hidden as SUCCESS).
+        2. local.status is SUCCESS and mirror.status is FAILED.
+        3. mirror failure errorCode is recorded from allowlist.
+        4. completed_at ISO timestamp is preserved for watcher dedupe.
+        5. Worker process exits with code 1.
+        """
+        def handle_health(req):
+            req.send_response(200)
+            req.send_header("Content-Type", "application/json")
+            req.end_headers()
+            req.wfile.write(b'{"ok": true}')
+
+        def handle_status(req):
+            req.send_response(200)
+            req.send_header("Content-Type", "application/json")
+            req.end_headers()
+            req.wfile.write(b'{"ready": true, "counts": {"messages": 1000}, "dbUpdatedKst": "2026-09-14 10:00:00 KST"}')
+
+        def handle_sync(req):
+            req.send_response(200)
+            req.send_header("Content-Type", "application/json")
+            req.end_headers()
+            req.wfile.write(b'{"ok": true}')
+
+        self.mock_server.register("GET", "/api/health", handle_health)
+        self.mock_server.register("GET", "/api/status", handle_status)
+        self.mock_server.register("POST", "/api/sync", handle_sync)
+
+        # Setup mock failing mirror script and mirror state in root_dir
+        mock_output_dir = self.root_dir / "output" / "testuser"
+        mock_output_dir.mkdir(parents=True, exist_ok=True)
+        mirror_state_file = mock_output_dir / "mirror_state.json"
+        mirror_state_file.write_text(json.dumps({
+            "status": "FAILED",
+            "lastStage": "REMOTE_VERIFY",
+            "errorCode": "HASH_MISMATCH",
+            "lastErrorKst": "2026-09-24T08:00:00+09:00",
+        }), encoding="utf-8")
+
+        mock_post_sync = self.root_dir / "post-sync-mirror.ps1"
+        mock_post_sync.write_text(
+            "param([switch]$UploadOnly)\n"
+            "Write-Error '[post-sync-mirror] kwin v2mirror failed with exit code 1'\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+
+        # Run worker WITHOUT -SkipMirror, passing our mock post-sync script
+        cmd = [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(SYNC_SCRIPT),
+            "-RootDirectory",
+            str(self.root_dir),
+            "-ApiBase",
+            self.api_base,
+            "-MutexName",
+            self.mutex_name,
+            "-SkipProcessCheck",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 1, f"Worker must exit 1 on mirror failure. Output: {proc.stdout}\nStderr: {proc.stderr}")
+
+        self.assertTrue(self.state_file.exists())
+        state = json.loads(self.state_file.read_text(encoding="utf-8"))
+
+        # Must not hide mirror failure as SUCCESS
+        self.assertEqual(state.get("status"), "FAILED", f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}\nstate:\n{json.dumps(state)}")
+        self.assertEqual(state.get("stage"), "REMOTE_VERIFY")
+        self.assertEqual(state.get("error"), "HASH_MISMATCH")
+        self.assertIn("completed_at", state)
+
+        # Check independent local and mirror structures
+        self.assertIn("local", state)
+        self.assertEqual(state["local"].get("status"), "SUCCESS")
+        self.assertEqual(state["local"].get("messages_after"), 1000)
+
+        self.assertIn("mirror", state)
+        self.assertEqual(state["mirror"].get("status"), "FAILED")
+        self.assertEqual(state["mirror"].get("error"), "HASH_MISMATCH")
+
+    def test_stale_mirror_state_not_reused_and_records_local_success_mirror_fail_with_diag_log(self):
+        """Verify reproduction of observed incident (2026-09-26 09:19):
+        1. Local sync succeeds (counts: messages 1,000).
+        2. A stale mirror_state.json exists from 2 days prior (status=SUCCESS, lastStage=COMPLETE).
+        3. Mirror child process fails with non-zero exit code (1) and produces NO fresh state.
+        4. Stale COMPLETE state MUST NOT be reused.
+        5. Top-level status is FAILED, but local.status is SUCCESS and mirror.status is FAILED.
+        6. stage is not COMPLETE (fallback 'mirror'), error is MIRROR_FAILED.
+        7. A separate JSONL diagnostic log is written recording child_exit_code, fresh_state=False,
+           lastStage, allowlist-based errorCode without any sensitive payloads/paths.
+        """
+        def handle_health(req):
+            req.send_response(200)
+            req.send_header("Content-Type", "application/json")
+            req.end_headers()
+            req.wfile.write(b'{"ok": true}')
+
+        def handle_status(req):
+            req.send_response(200)
+            req.send_header("Content-Type", "application/json")
+            req.end_headers()
+            req.wfile.write(b'{"ready": true, "counts": {"messages": 1000}, "dbUpdatedKst": "2026-09-14 10:00:00 KST"}')
+
+        def handle_sync(req):
+            req.send_response(200)
+            req.send_header("Content-Type", "application/json")
+            req.end_headers()
+            req.wfile.write(b'{"ok": true}')
+
+        self.mock_server.register("GET", "/api/health", handle_health)
+        self.mock_server.register("GET", "/api/status", handle_status)
+        self.mock_server.register("POST", "/api/sync", handle_sync)
+
+        # Setup STALE mirror_state.json (status=SUCCESS, lastStage=COMPLETE from 2 days ago)
+        mock_output_dir = self.root_dir / "output" / "testuser"
+        mock_output_dir.mkdir(parents=True, exist_ok=True)
+        mirror_state_file = mock_output_dir / "mirror_state.json"
+        mirror_state_file.write_text(json.dumps({
+            "status": "SUCCESS",
+            "lastStage": "COMPLETE",
+            "lastSuccessKst": "2026-09-24 10:00:00 KST",
+            "localSnapshot": {"messageCount": 500, "sha256": "abcdef"},
+            "remoteMirror": {"messageCount": 500, "sha256": "abcdef"},
+        }), encoding="utf-8")
+        # Set modification time to 2 days in the past
+        old_time = time.time() - 172800
+        os.utime(mirror_state_file, (old_time, old_time))
+
+        # Mirror child fails with exit code 1 and writes nothing
+        mock_post_sync = self.root_dir / "post-sync-mirror.ps1"
+        mock_post_sync.write_text(
+            "param([switch]$UploadOnly)\n"
+            "Write-Error '[post-sync-mirror] child crashed'\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+
+        cmd = [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(SYNC_SCRIPT),
+            "-RootDirectory",
+            str(self.root_dir),
+            "-ApiBase",
+            self.api_base,
+            "-MutexName",
+            self.mutex_name,
+            "-SkipProcessCheck",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 1, f"Worker must exit 1 on mirror failure. Output: {proc.stdout}\nStderr: {proc.stderr}")
+
+        self.assertTrue(self.state_file.exists())
+        state = json.loads(self.state_file.read_text(encoding="utf-8"))
+
+        # Top-level status is FAILED
+        self.assertEqual(state.get("status"), "FAILED")
+        # Stage must NEVER be COMPLETE on failure!
+        self.assertNotEqual(state.get("stage"), "COMPLETE")
+        self.assertEqual(state.get("stage"), "mirror")
+        self.assertEqual(state.get("error"), "MIRROR_FAILED")
+
+        # Independent local and mirror structures: local MUST be SUCCESS, mirror MUST be FAILED
+        self.assertIn("local", state)
+        self.assertEqual(state["local"].get("status"), "SUCCESS")
+        self.assertEqual(state["local"].get("messages_after"), 1000)
+
+        self.assertIn("mirror", state)
+        self.assertEqual(state["mirror"].get("status"), "FAILED")
+        self.assertNotEqual(state["mirror"].get("stage"), "COMPLETE")
+        self.assertEqual(state["mirror"].get("error"), "MIRROR_FAILED")
+
+        # Verify separate JSONL diagnostic log
+        diag_files = list(self.log_dir.glob("mirror-diag-*.jsonl"))
+        self.assertTrue(len(diag_files) > 0, f"Expected mirror-diag-*.jsonl in {self.log_dir}, found none.")
+        diag_lines = [l.strip() for l in diag_files[0].read_text(encoding="utf-8").splitlines() if l.strip()]
+        self.assertTrue(len(diag_lines) > 0)
+        diag = json.loads(diag_lines[-1])
+
+        # Contract assertions for diagnostic log
+        self.assertIn("timestamp", diag)
+        self.assertEqual(diag.get("exit_code"), 1)
+        self.assertEqual(diag.get("fresh_state"), False)
+        self.assertEqual(diag.get("lastStage"), "mirror")
+        self.assertEqual(diag.get("errorCode"), "MIRROR_FAILED")
+
+        # Sensitive info check: no path, no remote host, no stdout/stderr, no raw error
+        diag_raw = diag_files[0].read_text(encoding="utf-8")
+        self.assertNotIn("D:\\kakao", diag_raw)
+        self.assertNotIn("child crashed", diag_raw)
+        self.assertNotIn("Write-Error", diag_raw)
+
+    def test_mirror_failure_with_unallowlisted_error_code_falls_back_to_mirror_failed(self):
+        """Verify that an unallowlisted error code from fresh mirror state falls back to MIRROR_FAILED."""
+        def handle_health(req):
+            req.send_response(200)
+            req.send_header("Content-Type", "application/json")
+            req.end_headers()
+            req.wfile.write(b'{"ok": true}')
+
+        def handle_status(req):
+            req.send_response(200)
+            req.send_header("Content-Type", "application/json")
+            req.end_headers()
+            req.wfile.write(b'{"ready": true, "counts": {"messages": 1000}, "dbUpdatedKst": "2026-09-14 10:00:00 KST"}')
+
+        def handle_sync(req):
+            req.send_response(200)
+            req.send_header("Content-Type", "application/json")
+            req.end_headers()
+            req.wfile.write(b'{"ok": true}')
+
+        self.mock_server.register("GET", "/api/health", handle_health)
+        self.mock_server.register("GET", "/api/status", handle_status)
+        self.mock_server.register("POST", "/api/sync", handle_sync)
+
+        mock_output_dir = self.root_dir / "output" / "testuser"
+        mock_output_dir.mkdir(parents=True, exist_ok=True)
+        mirror_state_file = mock_output_dir / "mirror_state.json"
+        mirror_state_file.write_text(json.dumps({
+            "status": "FAILED",
+            "lastStage": "REMOTE_VERIFY",
+            "errorCode": "ARBITRARY_UNALLOWLISTED_ERROR_CODE_XYZ",
+            "lastErrorKst": "2026-09-24T08:00:00+09:00",
+        }), encoding="utf-8")
+
+        mock_post_sync = self.root_dir / "post-sync-mirror.ps1"
+        mock_post_sync.write_text(
+            "param([switch]$UploadOnly)\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+
+        cmd = [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(SYNC_SCRIPT),
+            "-RootDirectory",
+            str(self.root_dir),
+            "-ApiBase",
+            self.api_base,
+            "-MutexName",
+            self.mutex_name,
+            "-SkipProcessCheck",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 1)
+
+        state = json.loads(self.state_file.read_text(encoding="utf-8"))
+        # Unallowlisted error code must fallback to MIRROR_FAILED
+        self.assertEqual(state.get("error"), "MIRROR_FAILED")
+        self.assertEqual(state["mirror"].get("error"), "MIRROR_FAILED")
+
+    def test_post_sync_mirror_runner_resolves_kwin_from_external_cwd(self):
+        """Verify that post-sync-mirror.ps1 ensures PYTHONPATH and sets ProjectRoot so kwin is resolved even when called from an arbitrary external Cwd."""
+        repo_root = Path(__file__).resolve().parent.parent
+        post_sync_script = repo_root / "post-sync-mirror.ps1"
+        self.assertTrue(post_sync_script.exists())
+
+        with tempfile.TemporaryDirectory() as external_cwd:
+            cmd = [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(post_sync_script),
+                "-Status",
+            ]
+            proc = subprocess.run(cmd, cwd=external_cwd, capture_output=True, text=True, timeout=15)
+            self.assertEqual(proc.returncode, 0, f"Failed from external cwd: {proc.stderr}")
+
+            # Verify that .venv python resolves kwin when invoked from external cwd
+            venv_python = repo_root / ".venv" / "Scripts" / "python.exe"
+            python_bin = str(venv_python) if venv_python.exists() else sys.executable
+            py_cmd = [
+                python_bin,
+                "-c",
+                "import kwin; print('OK')",
+            ]
+            proc_py = subprocess.run(py_cmd, cwd=external_cwd, capture_output=True, text=True, timeout=15)
+            self.assertEqual(proc_py.returncode, 0, f"Python kwin import failed from external cwd: {proc_py.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()
