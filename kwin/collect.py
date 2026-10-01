@@ -117,6 +117,36 @@ def _json_names(value: Any) -> List[str]:
     return names
 
 
+def classify_room_type(room_type: Optional[str]) -> tuple[Optional[int], str]:
+    """Classify Kakao room type into (isOpenChat, roomCategory).
+
+    Rules:
+      - OM -> isOpenChat=1, roomCategory="open_group"
+      - OD -> isOpenChat=1, roomCategory="open_direct"
+      - MultiChat -> isOpenChat=0, roomCategory="normal_group"
+      - DirectChat -> isOpenChat=0, roomCategory="normal_direct"
+      - PlusChat -> isOpenChat=0, roomCategory="channel"
+      - MemoChat -> isOpenChat=0, roomCategory="memo"
+      - Other / NULL -> isOpenChat=None, roomCategory="unknown"
+    """
+    if not room_type or not isinstance(room_type, str):
+        return None, "unknown"
+    rt = room_type.strip()
+    if rt == "OM":
+        return 1, "open_group"
+    if rt == "OD":
+        return 1, "open_direct"
+    if rt == "MultiChat":
+        return 0, "normal_group"
+    if rt == "DirectChat":
+        return 0, "normal_direct"
+    if rt == "PlusChat":
+        return 0, "channel"
+    if rt == "MemoChat":
+        return 0, "memo"
+    return None, "unknown"
+
+
 def load_rooms(chatlist_sqlite: str, contacts: Dict[int, str]) -> Dict[int, Dict[str, Any]]:
     """Load chat room metadata from current/v2 chatListInfo.sqlite."""
     rooms: Dict[int, Dict[str, Any]] = {}
@@ -164,11 +194,15 @@ def load_rooms(chatlist_sqlite: str, contacts: Dict[int, str]) -> Dict[int, Dict
             if not title:
                 title = f"chatId:{chat_id}"
                 source = "fallback"
+            raw_type = _decode_text(d.get(c_type)) if c_type else None
+            is_open_chat, room_category = classify_room_type(raw_type)
             rooms[chat_id] = {
                 "chatId": chat_id,
                 "title": title,
                 "titleSource": source,
-                "type": _decode_text(d.get(c_type)) if c_type else None,
+                "type": raw_type,
+                "isOpenChat": is_open_chat,
+                "roomCategory": room_category,
                 "activeMembersCount": _to_int(d.get(c_count)) if c_count else None,
                 "useCustomChatRoomTitle": _to_int(d.get(c_custom)) if c_custom else None,
                 "directChatMemberId": direct_id,
@@ -224,14 +258,39 @@ def _iso(ts) -> Optional[str]:
 
 
 def build(decrypted_dir: str, out_sqlite: str, contacts: Dict[int, str]) -> int:
-    """Merge all chatLogs_*.sqlite in decrypted_dir into out_sqlite. Returns row count."""
+    """Merge all chatLogs_*.sqlite in decrypted_dir into out_sqlite. Returns row count.
+
+    Preserves reply relationships and structural fields:
+      - threadId: comment-thread parent message logId. Zero normalized to NULL.
+      - threadScope: integer scope code extracted from supplement.scope (e.g. 2, 3).
+      - prevLogId: chronological sequence linkage (immediate predecessor in room).
+      - referer: message routing / client entry flag (not a conversational parent).
+      - attachmentSrcLogId: quoted message source logId from attachement.src_logId.
+      - replyToLogId: normalized quote/reply source logId, distinct from thread parent.
+      - supplementJson: raw supplement payload stored verbatim.
+      - attachmentJson: raw attachement payload stored verbatim.
+    """
     out = sqlite3.connect(out_sqlite)
     # This is a generated consolidation DB. Rebuild it from the decrypted files
     # every run so stale rows from an earlier extraction cannot linger.
     out.execute("DROP TABLE IF EXISTS messages")
     out.execute("""CREATE TABLE IF NOT EXISTS messages(
-        chatId INTEGER, logId INTEGER, authorId INTEGER, authorName TEXT,
-        type INTEGER, message TEXT, sentAt INTEGER, sentAtIso TEXT,
+        chatId INTEGER,
+        logId INTEGER,
+        authorId INTEGER,
+        authorName TEXT,
+        type INTEGER,
+        message TEXT,
+        sentAt INTEGER,
+        sentAtIso TEXT,
+        threadId INTEGER,
+        threadScope INTEGER,
+        prevLogId INTEGER,
+        referer INTEGER,
+        attachmentSrcLogId INTEGER,
+        supplementJson TEXT,
+        attachmentJson TEXT,
+        replyToLogId INTEGER,
         PRIMARY KEY(chatId, logId))""")
     total = 0
     for path in sorted(glob.glob(os.path.join(decrypted_dir, "chatLogs_*.sqlite"))):
@@ -251,16 +310,113 @@ def build(decrypted_dir: str, out_sqlite: str, contacts: Dict[int, str]) -> int:
             c_type = _pick(cols, "type")
             c_msg = _pick(cols, "message")
             c_time = _pick(cols, "sendAt", "createdAt", "sentAt", "created_at")
-            sel = ", ".join(c for c in (c_id, c_author, c_type, c_msg, c_time) if c)
+            c_thread = _pick(cols, "threadId")
+            c_prev = _pick(cols, "prevLogId")
+            c_ref = _pick(cols, "referer")
+            c_supp = _pick(cols, "supplement")
+            c_att = _pick(cols, "attachement", "attachment")
+
+            wanted = [c_id, c_author, c_type, c_msg, c_time, c_thread, c_prev, c_ref, c_supp, c_att]
+            sel_cols = [c for c in wanted if c]
+            sel = ", ".join(sel_cols)
+
+            batch: List[tuple] = []
             for row in con.execute(f"SELECT {sel} FROM chatLogs"):
-                d = dict(zip([c for c in (c_id, c_author, c_type, c_msg, c_time) if c], row))
-                author = _to_int(d.get(c_author))
-                ts = d.get(c_time)
-                out.execute(
-                    "INSERT OR IGNORE INTO messages VALUES (?,?,?,?,?,?,?,?)",
-                    (chat_id, d.get(c_id), author, contacts.get(author, str(author)),
-                     d.get(c_type), _decode_text(d.get(c_msg)), ts, _iso(ts)))
-                total += 1
+                d = dict(zip(sel_cols, row))
+                log_id = _to_int(d.get(c_id)) if c_id else None
+                author = _to_int(d.get(c_author)) if c_author else None
+                msg_type = _to_int(d.get(c_type)) if c_type else None
+                msg_text = _decode_text(d.get(c_msg)) if c_msg else None
+                ts = d.get(c_time) if c_time else None
+                ts_iso = _iso(ts)
+
+                # 1. threadId: normalized zero to NULL
+                raw_thread = _to_int(d.get(c_thread)) if c_thread else None
+                thread_id: Optional[int] = raw_thread if isinstance(raw_thread, int) and raw_thread != 0 else None
+
+                # 2. prevLogId: chronological predecessor pointer
+                raw_prev = _to_int(d.get(c_prev)) if c_prev else None
+                prev_log_id: Optional[int] = raw_prev if isinstance(raw_prev, int) else None
+
+                # 3. referer: client entry / routing flag (not parent)
+                raw_ref = _to_int(d.get(c_ref)) if c_ref else None
+                referer: Optional[int] = raw_ref if isinstance(raw_ref, int) else None
+
+                # 4. Verbatim JSON texts (robust against decode errors)
+                supp_text = _decode_text(d.get(c_supp)) if c_supp else None
+                supplement_json: Optional[str] = supp_text if (isinstance(supp_text, str) and supp_text.strip()) else None
+
+                att_text = _decode_text(d.get(c_att)) if c_att else None
+                attachment_json: Optional[str] = att_text if (isinstance(att_text, str) and att_text.strip()) else None
+
+                # 5. Extract threadScope & optional fallback threadId from supplement
+                # Malformed JSON must not drop messages
+                thread_scope: Optional[int] = None
+                if supplement_json:
+                    try:
+                        supp_obj = json.loads(supplement_json)
+                        if isinstance(supp_obj, dict):
+                            raw_scope = supp_obj.get("scope")
+                            if raw_scope is not None:
+                                try:
+                                    thread_scope = int(raw_scope)
+                                except (ValueError, TypeError):
+                                    thread_scope = None
+                            if thread_id is None:
+                                raw_supp_thread = supp_obj.get("threadId")
+                                if raw_supp_thread is not None:
+                                    try:
+                                        supp_tid = int(raw_supp_thread)
+                                        if supp_tid != 0:
+                                            thread_id = supp_tid
+                                    except (ValueError, TypeError):
+                                        pass
+                    except Exception:
+                        pass
+
+                # 6. Extract attachmentSrcLogId from attachement.src_logId
+                attachment_src_log_id: Optional[int] = None
+                if attachment_json:
+                    try:
+                        att_obj = json.loads(attachment_json)
+                        if isinstance(att_obj, dict):
+                            raw_src = att_obj.get("src_logId")
+                            if raw_src is not None:
+                                try:
+                                    src_id = int(raw_src)
+                                    if src_id != 0:
+                                        attachment_src_log_id = src_id
+                                except (ValueError, TypeError):
+                                    pass
+                    except Exception:
+                        pass
+
+                # 7. Quoted / replied source logId normalized (kept separate from threadId)
+                reply_to_log_id: Optional[int] = attachment_src_log_id
+
+                author_name = contacts.get(author, str(author) if author is not None else "")
+                batch.append((
+                    chat_id, log_id, author, author_name,
+                    msg_type, msg_text, ts, ts_iso,
+                    thread_id, thread_scope, prev_log_id, referer,
+                    attachment_src_log_id, supplement_json, attachment_json,
+                    reply_to_log_id,
+                ))
+                if len(batch) >= 5000:
+                    out.executemany(
+                        "INSERT OR IGNORE INTO messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        batch,
+                    )
+                    total += len(batch)
+                    batch.clear()
+
+            if batch:
+                out.executemany(
+                    "INSERT OR IGNORE INTO messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    batch,
+                )
+                total += len(batch)
+                batch.clear()
         except sqlite3.Error:
             pass
         finally:
@@ -292,27 +448,37 @@ def write_metadata(out_sqlite: str, contacts: Dict[int, str],
             title TEXT,
             titleSource TEXT,
             type TEXT,
+            isOpenChat INTEGER,
+            roomCategory TEXT,
             activeMembersCount INTEGER,
             useCustomChatRoomTitle INTEGER,
             directChatMemberId INTEGER,
             lastUpdatedAt INTEGER,
             lastChatMessage TEXT
         )""")
+        room_rows = []
+        for _chat_id, r in sorted(rooms.items()):
+            raw_type = r.get("type")
+            is_open = r.get("isOpenChat")
+            cat = r.get("roomCategory")
+            if is_open is None and (cat is None or cat == "unknown") and raw_type:
+                is_open, cat = classify_room_type(raw_type)
+            if cat is None:
+                cat = "unknown"
+            room_rows.append((
+                r.get("chatId"), r.get("title"), r.get("titleSource"),
+                raw_type, is_open, cat,
+                r.get("activeMembersCount"),
+                r.get("useCustomChatRoomTitle"), r.get("directChatMemberId"),
+                r.get("lastUpdatedAt"), r.get("lastChatMessage"),
+            ))
         out.executemany(
             """INSERT OR REPLACE INTO rooms(
-                chatId, title, titleSource, type, activeMembersCount,
-                useCustomChatRoomTitle, directChatMemberId, lastUpdatedAt,
-                lastChatMessage
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [
-                (
-                    r.get("chatId"), r.get("title"), r.get("titleSource"),
-                    r.get("type"), r.get("activeMembersCount"),
-                    r.get("useCustomChatRoomTitle"), r.get("directChatMemberId"),
-                    r.get("lastUpdatedAt"), r.get("lastChatMessage"),
-                )
-                for _chat_id, r in sorted(rooms.items())
-            ],
+                chatId, title, titleSource, type, isOpenChat, roomCategory,
+                activeMembersCount, useCustomChatRoomTitle, directChatMemberId,
+                lastUpdatedAt, lastChatMessage
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            room_rows,
         )
 
         out.execute("DROP TABLE IF EXISTS room_members")
@@ -338,3 +504,48 @@ def write_metadata(out_sqlite: str, contacts: Dict[int, str],
         out.commit()
     finally:
         out.close()
+
+
+def migrate_rooms(out_sqlite: str) -> None:
+    """Migrate legacy rooms table schema in consolidated SQLite DB to add
+
+    isOpenChat and roomCategory columns, backfilling them based on room type.
+    """
+    if not os.path.exists(out_sqlite):
+        return
+    con = sqlite3.connect(out_sqlite)
+    try:
+        has_rooms = bool(
+            con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rooms'").fetchone()
+        )
+        if not has_rooms:
+            return
+
+        cur = con.cursor()
+        cols = {r[1] for r in cur.execute("PRAGMA table_info(rooms)").fetchall()}
+        if "isOpenChat" not in cols:
+            cur.execute("ALTER TABLE rooms ADD COLUMN isOpenChat INTEGER")
+        if "roomCategory" not in cols:
+            cur.execute("ALTER TABLE rooms ADD COLUMN roomCategory TEXT")
+
+        cur.execute("""
+            UPDATE rooms SET
+              isOpenChat = CASE
+                WHEN type IN ('OM', 'OD') THEN 1
+                WHEN type IN ('MultiChat', 'DirectChat', 'PlusChat', 'MemoChat') THEN 0
+                ELSE NULL
+              END,
+              roomCategory = CASE
+                WHEN type = 'OM' THEN 'open_group'
+                WHEN type = 'OD' THEN 'open_direct'
+                WHEN type = 'MultiChat' THEN 'normal_group'
+                WHEN type = 'DirectChat' THEN 'normal_direct'
+                WHEN type = 'PlusChat' THEN 'channel'
+                WHEN type = 'MemoChat' THEN 'memo'
+                ELSE 'unknown'
+              END
+            WHERE isOpenChat IS NULL OR roomCategory IS NULL OR roomCategory = 'unknown'
+        """)
+        con.commit()
+    finally:
+        con.close()
