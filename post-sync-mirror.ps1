@@ -11,7 +11,8 @@ param(
     [System.Nullable[int]]$VpsUid = $null,
     [System.Nullable[int]]$VpsGid = $null,
     [string]$SshKey,
-    [int]$SshPort
+    [int]$SshPort,
+    [int]$TotalDeadlineSec = 840
 )
 
 $ErrorActionPreference = "Stop"
@@ -90,6 +91,15 @@ if ($PSBoundParameters.ContainsKey('VpsGid')) {
         exit 1
     }
 }
+if ($PSBoundParameters.ContainsKey('TotalDeadlineSec')) {
+    if ($null -eq $TotalDeadlineSec -or $TotalDeadlineSec -le 0) {
+        Write-Error "[post-sync-mirror] TotalDeadlineSec must be a positive integer (> 0), got: $TotalDeadlineSec"
+        exit 1
+    }
+    if ($TotalDeadlineSec -gt 840) {
+        $TotalDeadlineSec = 840
+    }
+}
 
 if (Test-Path -LiteralPath $StopMarker) {
     Write-Host "[post-sync-mirror] STOP marker detected. Mirroring skipped."
@@ -118,6 +128,7 @@ try {
     if ($PSBoundParameters.ContainsKey('VpsGid')) { $MirrorArgs += @("--vps-gid", "$VpsGid") }
     if ($SshKey) { $MirrorArgs += @("--ssh-key", $SshKey) }
     if ($SshPort) { $MirrorArgs += @("--ssh-port", "$SshPort") }
+    if ($PSBoundParameters.ContainsKey('TotalDeadlineSec')) { $MirrorArgs += @("--total-deadline-sec", "$TotalDeadlineSec") }
 
     & $PythonExe @MirrorArgs
     $MirrorExit = $LASTEXITCODE

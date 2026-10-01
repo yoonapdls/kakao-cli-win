@@ -943,6 +943,12 @@ def cmd_v2mirror(args):
     )
     vps_uid = getattr(args, "vps_uid", None)
     vps_gid = getattr(args, "vps_gid", None)
+    total_deadline = getattr(args, "total_deadline_sec", None)
+    if total_deadline is None and os.environ.get("KAKAO_MIRROR_TOTAL_DEADLINE_SEC"):
+        try:
+            total_deadline = float(os.environ["KAKAO_MIRROR_TOTAL_DEADLINE_SEC"])
+        except ValueError:
+            total_deadline = None
 
     try:
         res = mirror.sync_mirror(
@@ -958,6 +964,7 @@ def cmd_v2mirror(args):
             ssh_key_path=ssh_key,
             ssh_port=ssh_port,
             upload_only=getattr(args, "upload_only", False),
+            total_deadline_sec=total_deadline if total_deadline is not None else 840,
         )
         print(json.dumps(res, ensure_ascii=False, indent=2))
     except mirror.MirrorPipelineError as exc:
@@ -1279,6 +1286,7 @@ def main(argv=None):
             sp.add_argument("--ssh-key", default=None, help="path to SSH private key")
             sp.add_argument("--ssh-port", type=int, default=None, help="SSH port")
             sp.add_argument("--upload-only", action="store_true", help="run mirror sync without pre-decrypt")
+            sp.add_argument("--total-deadline-sec", type=float, default=None, help="total deadline budget in seconds (default: 840)")
             sp.add_argument("--disable", action="store_true", help="disable automatic mirroring via STOP marker")
             sp.add_argument("--enable", action="store_true", help="enable automatic mirroring by removing STOP marker")
         if name == "extractkey":

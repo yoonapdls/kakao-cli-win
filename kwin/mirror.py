@@ -44,7 +44,9 @@ KST = timezone(timedelta(hours=9), "KST")
 
 DEFAULT_STAGE_TIMEOUTS = {
     "prepare": 30,
+    "compress": 60,
     "upload": 300,
+    "decompress": 120,
     "verify": 600,
     "download": 60,
     "replace": 30,
@@ -337,6 +339,40 @@ def create_readonly_snapshot(src_db_path: str | Path, snapshot_path: str | Path)
         "minSentAtIso": stats["minSentAtIso"],
         "maxSentAtIso": stats["maxSentAtIso"],
         "createdAtKst": _now_kst(),
+    }
+
+
+def compress_file_gzip(src_path: str | Path, dst_gz_path: str | Path) -> Dict[str, Any]:
+    """Compress source file to dst_gz_path using standard gzip with atomic temp file replacement.
+
+    Returns size and sha256 of compressed file.
+    """
+    src = Path(src_path).resolve()
+    dst = Path(dst_gz_path).resolve()
+    if not src.exists():
+        raise FileNotFoundError(f"Source file to compress not found: {src.name}")
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    temp_dst = dst.with_name(f"{dst.name}.tmp_{os.getpid()}_{time.time_ns()}")
+    try:
+        import gzip
+        import shutil
+        with open(src, "rb") as f_in, gzip.open(temp_dst, "wb", compresslevel=6) as f_out:
+            shutil.copyfileobj(f_in, f_out, length=1024 * 1024)
+        os.replace(temp_dst, dst)
+    except Exception as exc:
+        if temp_dst.exists():
+            try:
+                temp_dst.unlink()
+            except OSError:
+                pass
+        raise MirrorPipelineError("LOCAL_COMPRESS", "COMPRESS_FAILED") from exc
+
+    gz_size = dst.stat().st_size
+    gz_sha = compute_sha256(dst)
+    return {
+        "sizeBytes": gz_size,
+        "sha256": gz_sha,
     }
 
 
@@ -736,6 +772,7 @@ def sync_mirror(
     download_runner: Optional[Any] = None,
     upload_only: bool = False,
     stage_timeouts: Optional[Dict[str, int]] = None,
+    total_deadline_sec: Optional[float | int] = 840,
 ) -> Dict[str, Any]:
     """Execute complete mirror sync pipeline with atomic replacement and verification."""
     stop_path = Path(stop_file).resolve()
@@ -758,9 +795,40 @@ def sync_mirror(
     state.update(status="IN_PROGRESS", lastStage="INIT", lastAttemptKst=_now_kst())
     current_stage = "INIT"
     snapshot_file: Optional[Path] = None
+    snapshot_gz: Optional[Path] = None
     local_meta_file: Optional[Path] = None
+    snap_meta: Optional[Dict[str, Any]] = None
+
+    if total_deadline_sec is not None:
+        try:
+            deadline_budget = max(1.0, min(840.0, float(total_deadline_sec)))
+        except (ValueError, TypeError):
+            deadline_budget = 840.0
+    else:
+        deadline_budget = 840.0
+
+    deadline_monotonic = time.monotonic() + deadline_budget
+
+    stage_timings: Dict[str, float] = {}
+    t0_perf = time.perf_counter()
+    gz_meta: Optional[Dict[str, Any]] = None
 
     try:
+        timeouts = dict(DEFAULT_STAGE_TIMEOUTS)
+        if stage_timeouts:
+            timeouts.update(stage_timeouts)
+
+        def _get_stage_timeout(stage_name: str, default_limit: int = 30) -> int:
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise MirrorPipelineError(current_stage, "TIMEOUT")
+            configured_limit = timeouts.get(stage_name, default_limit)
+            return max(1, min(configured_limit, int(remaining)))
+
+        def _check_deadline() -> None:
+            if time.monotonic() >= deadline_monotonic:
+                raise MirrorPipelineError(current_stage, "TIMEOUT")
+
         src_path = Path(src_db).resolve()
         snap_dir = Path(snapshot_dir).resolve()
         snap_dir.mkdir(parents=True, exist_ok=True)
@@ -768,37 +836,68 @@ def sync_mirror(
 
         # Step 1: Create local read-only consistent snapshot
         current_stage = "LOCAL_SNAPSHOT"
+        _check_deadline()
+        t_stage = time.perf_counter()
         snap_meta = create_readonly_snapshot(src_path, snapshot_file)
+        stage_timings["LOCAL_SNAPSHOT"] = round(time.perf_counter() - t_stage, 3)
+        state.update(
+            localSnapshot=snap_meta,
+            local={
+                "status": "SUCCESS",
+                "stage": "COMPLETE",
+                "messageCount": snap_meta.get("messageCount", 0),
+            },
+        )
 
         # If VPS target is not configured, complete after local snapshot
         if not vps_ssh_target or not vps_remote_dir:
+            total_elapsed = round(time.perf_counter() - t0_perf, 3)
             state.update(
                 status="SNAPSHOT_CREATED",
                 lastStage="COMPLETE",
                 lastSuccessKst=_now_kst(),
                 localSnapshot=snap_meta,
+                stageTimings=stage_timings,
+                totalElapsedSeconds=total_elapsed,
+                local={
+                    "status": "SUCCESS",
+                    "stage": "COMPLETE",
+                    "messageCount": snap_meta.get("messageCount", 0),
+                },
+                mirror={
+                    "status": "SKIPPED",
+                },
             )
             return {
                 "status": "SNAPSHOT_CREATED",
                 "localSnapshot": snap_meta,
                 "remoteMirror": None,
+                "stageTimings": stage_timings,
+                "totalElapsedSeconds": total_elapsed,
                 "message": "Local snapshot created successfully (VPS target not configured).",
             }
 
+        # Step 1.1: Compress local snapshot with standard gzip
+        current_stage = "LOCAL_COMPRESS"
+        _check_deadline()
+        snapshot_gz = snap_dir / f"{snapshot_file.name}.gz"
+        t_stage = time.perf_counter()
+        gz_meta = compress_file_gzip(snapshot_file, snapshot_gz)
+        stage_timings["LOCAL_COMPRESS"] = round(time.perf_counter() - t_stage, 3)
+
         # Step 2: Validate remote parameters
         current_stage = "CONFIG_VALIDATION"
+        _check_deadline()
         target = validate_ssh_target(vps_ssh_target)
         remote_dir = validate_remote_path(vps_remote_dir)
         remote_partial = f"{remote_dir}/messages_v2.sqlite.partial"
+        remote_gz = f"{remote_partial}.gz"
         remote_current = f"{remote_dir}/messages_v2.sqlite"
 
         remote_dir_q = shlex.quote(remote_dir)
         remote_partial_q = shlex.quote(remote_partial)
+        remote_gz_q = shlex.quote(remote_gz)
         remote_current_q = shlex.quote(remote_current)
-
-        timeouts = dict(DEFAULT_STAGE_TIMEOUTS)
-        if stage_timeouts:
-            timeouts.update(stage_timeouts)
 
         base_ssh = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]
         base_scp = ["scp", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"]
@@ -822,7 +921,7 @@ def sync_mirror(
                 parent_dir_q = shlex.quote(parent_dir)
                 cmd = f"stat -c '%u %g' {parent_dir_q} 2>/dev/null"
                 try:
-                    c, out, _ = _exec_remote_ssh(cmd, timeout=timeouts.get("prepare", 30))
+                    c, out, _ = _exec_remote_ssh(cmd, timeout=_get_stage_timeout("prepare", 30))
                     if c == 0 and out:
                         parts = out.strip().split()
                         if len(parts) >= 2:
@@ -839,22 +938,26 @@ def sync_mirror(
             parent_stat_fn=_query_remote_parent_stat,
         )
 
-        def _cleanup_remote(clean_partial: bool = False, clean_meta_path: Optional[str] = None) -> None:
+        def _cleanup_remote(clean_partial: bool = False, clean_gz: bool = False, clean_meta_path: Optional[str] = None) -> None:
             parts = []
             if clean_partial and remote_partial_q:
                 parts.append(f"rm -f {remote_partial_q}")
+            if clean_gz and remote_gz_q:
+                parts.append(f"rm -f {remote_gz_q}")
             if clean_meta_path:
                 parts.append(f"rm -f {shlex.quote(clean_meta_path)}")
             if not parts:
                 return
             cleanup_cmd = " && ".join(parts)
             try:
-                _exec_remote_ssh(cleanup_cmd, timeout=timeouts.get("cleanup", 30))
+                _exec_remote_ssh(cleanup_cmd, timeout=_get_stage_timeout("cleanup", 30))
             except Exception:
                 pass
 
         # 2.1 Prepare remote directory (700) with approved owner UID:GID
         current_stage = "REMOTE_PREPARE"
+        _check_deadline()
+        t_stage = time.perf_counter()
         mkdir_cmd = (
             f"( mkdir -p {remote_dir_q} && "
             f"chown {uid}:{gid} {remote_dir_q} && "
@@ -863,37 +966,80 @@ def sync_mirror(
             f") > /dev/null 2>&1"
         )
         try:
-            code, out, err = _exec_remote_ssh(mkdir_cmd, timeout=timeouts.get("prepare", 30))
+            code, out, err = _exec_remote_ssh(mkdir_cmd, timeout=_get_stage_timeout("prepare", 30))
         except subprocess.TimeoutExpired:
             raise MirrorPipelineError("REMOTE_PREPARE", "TIMEOUT")
         except Exception:
             raise MirrorPipelineError("REMOTE_PREPARE", "CONNECT_FAILED")
 
         if code != 0:
+            if code == 28:
+                raise MirrorPipelineError("REMOTE_PREPARE", "DISK_FULL")
             raise MirrorPipelineError("REMOTE_PREPARE", "DIR_PREPARE_FAILED")
+        stage_timings["REMOTE_PREPARE"] = round(time.perf_counter() - t_stage, 3)
+        _check_deadline()
 
-        # 2.2 Upload snapshot to .partial
+        # 2.2 Upload compressed snapshot to remote .partial.gz
         current_stage = "REMOTE_UPLOAD"
-        remote_scp_dest = f"{target}:{remote_partial}"
+        _check_deadline()
+        t_stage = time.perf_counter()
+        remote_scp_dest = f"{target}:{remote_gz}"
         try:
+            up_timeout = _get_stage_timeout("upload", 300)
             if upload_runner:
-                code, out, err = _call_runner_with_timeout(upload_runner, base_scp, snapshot_file, remote_scp_dest, timeout=timeouts.get("upload", 300))
+                code, out, err = _call_runner_with_timeout(upload_runner, base_scp, snapshot_gz, remote_scp_dest, timeout=up_timeout)
             else:
-                code, out, err = run_sftp_upload(base_scp, snapshot_file, remote_scp_dest, timeout=timeouts.get("upload", 300))
+                code, out, err = run_sftp_upload(base_scp, snapshot_gz, remote_scp_dest, timeout=up_timeout)
         except subprocess.TimeoutExpired:
-            _cleanup_remote(clean_partial=True)
+            _cleanup_remote(clean_partial=True, clean_gz=True)
             raise MirrorPipelineError("REMOTE_UPLOAD", "TIMEOUT")
         except Exception:
-            _cleanup_remote(clean_partial=True)
+            _cleanup_remote(clean_partial=True, clean_gz=True)
             raise MirrorPipelineError("REMOTE_UPLOAD", "UPLOAD_FAILED")
 
         if code != 0:
-            _cleanup_remote(clean_partial=True)
+            _cleanup_remote(clean_partial=True, clean_gz=True)
             raise MirrorPipelineError("REMOTE_UPLOAD", "UPLOAD_FAILED")
+        stage_timings["REMOTE_UPLOAD"] = round(time.perf_counter() - t_stage, 3)
+        _check_deadline()
 
-        # 2.3 Verify remote partial:
+        # 2.3 Decompress remote .partial.gz into .partial candidate and enforce permissions
+        current_stage = "REMOTE_DECOMPRESS"
+        _check_deadline()
+        t_stage = time.perf_counter()
+        decompress_cmd = (
+            f"( "
+            f"( gzip -dc {remote_gz_q} > {remote_partial_q} || "
+            f"  {{ rc=$?; if [ \"$(df -k {remote_dir_q} 2>/dev/null | awk 'END{{print $(NF-2)}}')\" -le 1024 ] 2>/dev/null; then exit 28; fi; exit $rc; }} "
+            f") && "
+            f"chown {uid}:{gid} {remote_partial_q} && "
+            f"chmod 600 {remote_partial_q} && "
+            f"[ \"$(stat -c '%u:%g:%a' {remote_partial_q})\" = '{uid}:{gid}:600' ] && "
+            f"rm -f {remote_gz_q} "
+            f") > /dev/null 2>&1"
+        )
+        try:
+            d_code, d_out, d_err = _exec_remote_ssh(decompress_cmd, timeout=_get_stage_timeout("decompress", 120))
+        except subprocess.TimeoutExpired:
+            _cleanup_remote(clean_partial=True, clean_gz=True)
+            raise MirrorPipelineError("REMOTE_DECOMPRESS", "TIMEOUT")
+        except Exception:
+            _cleanup_remote(clean_partial=True, clean_gz=True)
+            raise MirrorPipelineError("REMOTE_DECOMPRESS", "DECOMPRESS_FAILED")
+
+        if d_code != 0:
+            _cleanup_remote(clean_partial=True, clean_gz=True)
+            if d_code == 28:
+                raise MirrorPipelineError("REMOTE_DECOMPRESS", "DISK_FULL")
+            raise MirrorPipelineError("REMOTE_DECOMPRESS", "DECOMPRESS_FAILED")
+        stage_timings["REMOTE_DECOMPRESS"] = round(time.perf_counter() - t_stage, 3)
+        _check_deadline()
+
+        # 2.4 Verify remote partial:
         # Pre-validate owner/mode on partial and remote_dir, and write verification metadata without stdout
         current_stage = "REMOTE_VERIFY"
+        _check_deadline()
+        t_stage = time.perf_counter()
         meta_token = secrets.token_hex(16)
         remote_meta_file = f"{remote_dir}/.verify_{meta_token}.meta"
         validate_remote_path(remote_meta_file)
@@ -914,40 +1060,43 @@ def sync_mirror(
             f") > /dev/null 2>&1"
         )
         try:
-            code, out, err = _exec_remote_ssh(verify_script, timeout=timeouts.get("verify", 600))
+            code, out, err = _exec_remote_ssh(verify_script, timeout=_get_stage_timeout("verify", 600))
         except subprocess.TimeoutExpired:
-            _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_VERIFY", "TIMEOUT")
         except Exception:
-            _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_VERIFY", "VERIFY_FAILED")
 
         if code != 0:
-            _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_VERIFY", "VERIFY_COMMAND_FAILED")
+        _check_deadline()
 
-        # 2.3.2 Download remote meta file via scp
+        # 2.4.2 Download remote meta file via scp
         remote_scp_meta_src = f"{target}:{remote_meta_file}"
         try:
+            dl_timeout = _get_stage_timeout("download", 60)
             if download_runner:
-                d_code, d_out, d_err = _call_runner_with_timeout(download_runner, base_scp, remote_scp_meta_src, local_meta_file, timeout=timeouts.get("download", 60))
+                d_code, d_out, d_err = _call_runner_with_timeout(download_runner, base_scp, remote_scp_meta_src, local_meta_file, timeout=dl_timeout)
             else:
-                d_code, d_out, d_err = run_scp_download(base_scp, remote_scp_meta_src, local_meta_file, timeout=timeouts.get("download", 60))
+                d_code, d_out, d_err = run_scp_download(base_scp, remote_scp_meta_src, local_meta_file, timeout=dl_timeout)
         except subprocess.TimeoutExpired:
-            _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_VERIFY", "TIMEOUT")
         except Exception:
-            _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_VERIFY", "DOWNLOAD_FAILED")
 
         if d_code != 0:
-            _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_VERIFY", "DOWNLOAD_FAILED")
+        _check_deadline()
 
-        # 2.3.3 Read and strictly parse local metadata, then delete local temp file
+        # 2.4.3 Read and strictly parse local metadata, then delete local temp file
         try:
             if not local_meta_file.exists():
-                _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+                _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
                 raise MirrorPipelineError("REMOTE_VERIFY", "DOWNLOAD_FAILED")
             raw_meta = local_meta_file.read_text(encoding="utf-8")
         finally:
@@ -960,7 +1109,7 @@ def sync_mirror(
         try:
             parsed_meta = parse_remote_meta(raw_meta)
         except Exception:
-            _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_VERIFY", "PARSE_ERROR")
 
         remote_integrity = parsed_meta["integrityCheck"]
@@ -970,52 +1119,42 @@ def sync_mirror(
         remote_sha256 = parsed_meta["sha256"]
 
         if remote_integrity != "ok":
-            _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_VERIFY", "INTEGRITY_FAILED")
 
         # Compare ALL THREE message metrics: count, min, max
         if remote_count != snap_meta["messageCount"]:
-            _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_VERIFY", "COUNT_MISMATCH")
 
         if remote_min != snap_meta["minSentAtIso"]:
-            _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_VERIFY", "MIN_TIMESTAMP_MISMATCH")
 
         if remote_max != snap_meta["maxSentAtIso"]:
-            _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_VERIFY", "MAX_TIMESTAMP_MISMATCH")
 
         # Compare size if available
         remote_size = parsed_meta.get("sizeBytes")
         if remote_size is not None and snap_meta.get("sizeBytes") is not None:
             if remote_size != snap_meta["sizeBytes"]:
-                _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+                _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
                 raise MirrorPipelineError("REMOTE_VERIFY", "SIZE_MISMATCH")
 
-        # Compare SHA-256 hash
+        # Compare SHA-256 hash (decompressed remote candidate vs uncompressed local snapshot)
         if remote_sha256.lower() != snap_meta["sha256"].lower():
-            _cleanup_remote(clean_partial=True, clean_meta_path=remote_meta_file)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_VERIFY", "HASH_MISMATCH")
 
-        # 2.3.4 Clean up remote meta file before atomic replace
-        # Cleanup failure must never cause current replacement!
-        clean_meta_cmd = f"rm -f {remote_meta_q}"
-        try:
-            m_code, m_out, m_err = _exec_remote_ssh(clean_meta_cmd, timeout=timeouts.get("cleanup", 30))
-        except subprocess.TimeoutExpired:
-            _cleanup_remote(clean_partial=True)
-            raise MirrorPipelineError("REMOTE_VERIFY", "TIMEOUT")
-        except Exception:
-            _cleanup_remote(clean_partial=True)
-            raise MirrorPipelineError("REMOTE_VERIFY", "CLEANUP_FAILED")
+        stage_timings["REMOTE_VERIFY"] = round(time.perf_counter() - t_stage, 3)
+        _check_deadline()
 
-        if m_code != 0:
-            _cleanup_remote(clean_partial=True)
-            raise MirrorPipelineError("REMOTE_VERIFY", "CLEANUP_FAILED")
-
-        # 2.4 Atomic replacement with rollback protection & owner/mode validation
+        # 2.5 Atomic replacement with rollback protection & owner/mode validation
+        # Verify meta cleanup is consolidated directly into replace_cmd to avoid separate SSH roundtrip failures
         current_stage = "REMOTE_REPLACE"
+        _check_deadline()
+        t_stage = time.perf_counter()
         rollback_token = secrets.token_hex(16)
         remote_rollback_file = f"{remote_dir}/.messages_v2.rollback_{rollback_token}"
         remote_nocur_file = f"{remote_dir}/.messages_v2.nocur_{rollback_token}"
@@ -1041,16 +1180,18 @@ def sync_mirror(
                 f"  rm -f {remote_current_q}; "
                 f"  rm -f {remote_nocur_q}; "
                 f"fi; "
-                f"rm -f {remote_partial_q} "
+                f"rm -f {remote_partial_q}; "
+                f"rm -f {remote_meta_q} "
                 f") > /dev/null 2>&1"
             )
             try:
-                _exec_remote_ssh(r_cmd, timeout=timeouts.get("replace", 30))
+                _exec_remote_ssh(r_cmd, timeout=_get_stage_timeout("replace", 30))
             except Exception:
                 pass
 
         replace_cmd = (
             f"( "
+            f"rm -f {remote_meta_q}; "
             f"[ -f {remote_partial_q} ] || exit 1; "
             f"[ \"$(stat -c '%u:%g:%a' {remote_partial_q})\" = '{uid}:{gid}:600' ] || exit 1; "
             f"[ \"$(stat -c '%u:%g:%a' {remote_dir_q})\" = '{uid}:{gid}:700' ] || exit 1; "
@@ -1064,8 +1205,8 @@ def sync_mirror(
             f"if mv -f {remote_partial_q} {remote_current_q} && "
             f"   chown {uid}:{gid} {remote_current_q} && "
             f"   chmod 600 {remote_current_q} && "
-            f"   [ \"$(stat -c '%u:%g:%a' {remote_current_q})\" = '{uid}:{gid}:600' ] && "
-            f"   [ \"$(stat -c '%u:%g:%a' {remote_dir_q})\" = '{uid}:{gid}:700' ]; then "
+            f"[ \"$(stat -c '%u:%g:%a' {remote_current_q})\" = '{uid}:{gid}:600' ] && "
+            f"[ \"$(stat -c '%u:%g:%a' {remote_dir_q})\" = '{uid}:{gid}:700' ]; then "
             f"  if [ $had_cur -eq 1 ]; then "
             f"    mv -f {remote_rollback_q} {remote_backup_q} && "
             f"    chown {uid}:{gid} {remote_backup_q} && "
@@ -1091,32 +1232,49 @@ def sync_mirror(
             f") > /dev/null 2>&1"
         )
         try:
-            code, out, err = _exec_remote_ssh(replace_cmd, timeout=timeouts.get("replace", 30))
+            code, out, err = _exec_remote_ssh(replace_cmd, timeout=_get_stage_timeout("replace", 30))
         except subprocess.TimeoutExpired:
             _rollback_remote()
-            _cleanup_remote(clean_partial=True)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_REPLACE", "TIMEOUT")
         except Exception:
             _rollback_remote()
-            _cleanup_remote(clean_partial=True)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_REPLACE", "REPLACE_FAILED")
 
         if code != 0:
             _rollback_remote()
-            _cleanup_remote(clean_partial=True)
+            _cleanup_remote(clean_partial=True, clean_gz=True, clean_meta_path=remote_meta_file)
             raise MirrorPipelineError("REMOTE_REPLACE", "REPLACE_FAILED")
+        stage_timings["REMOTE_REPLACE"] = round(time.perf_counter() - t_stage, 3)
+        _check_deadline()
 
-        # 2.5 Verify remote permissions & archive preservation without stdout
+        # 2.6 Verify remote permissions & archive preservation without stdout
         current_stage = "REMOTE_CHECK"
+        _check_deadline()
+        t_stage = time.perf_counter()
         check_archive_cmd = (
             f"( [ \"$(stat -c '%u:%g:%a' {remote_dir_q})\" = '{uid}:{gid}:700' ] && "
             f"[ \"$(stat -c '%u:%g:%a' {remote_current_q})\" = '{uid}:{gid}:600' ] && "
             f"ls -1 {remote_dir_q} | grep -q -E '^messages_v2.*20260908' ) >/dev/null 2>&1 || true"
         )
         try:
-            code, out, err = _exec_remote_ssh(check_archive_cmd, timeout=timeouts.get("check", 30))
+            code, out, err = _exec_remote_ssh(check_archive_cmd, timeout=_get_stage_timeout("check", 30))
         except Exception:
             pass
+        stage_timings["REMOTE_CHECK"] = round(time.perf_counter() - t_stage, 3)
+
+        total_elapsed = round(time.perf_counter() - t0_perf, 3)
+        snap_sz = snap_meta.get("sizeBytes", 0) if snap_meta else 0
+        gz_sz = gz_meta.get("sizeBytes", 0) if gz_meta else 0
+        saved_bytes = max(0, snap_sz - gz_sz)
+        reduction_pct = round((saved_bytes / snap_sz * 100), 2) if snap_sz > 0 else 0.0
+        comp_info = {
+            "snapshotBytes": snap_sz,
+            "gzipBytes": gz_sz,
+            "savedBytes": saved_bytes,
+            "reductionRatio": reduction_pct,
+        }
 
         remote_meta = {
             "integrityCheck": remote_integrity,
@@ -1135,12 +1293,28 @@ def sync_mirror(
             lastSuccessKst=_now_kst(),
             localSnapshot=snap_meta,
             remoteMirror=remote_meta,
+            compression=comp_info,
+            stageTimings=stage_timings,
+            totalElapsedSeconds=total_elapsed,
+            local={
+                "status": "SUCCESS",
+                "stage": "COMPLETE",
+                "messageCount": snap_meta.get("messageCount", 0),
+            },
+            mirror={
+                "status": "SUCCESS",
+                "stage": "COMPLETE",
+                "messageCount": remote_meta.get("messageCount", 0),
+            },
         )
 
         return {
             "status": "SUCCESS",
             "localSnapshot": snap_meta,
             "remoteMirror": remote_meta,
+            "compression": comp_info,
+            "stageTimings": stage_timings,
+            "totalElapsedSeconds": total_elapsed,
             "message": "Mirror sync successfully completed.",
         }
 
@@ -1161,12 +1335,38 @@ def sync_mirror(
             err_stage = current_stage
             err_code = "UNKNOWN_ERROR"
 
-        state.update(
-            status="FAILED",
-            lastStage=err_stage,
-            errorCode=err_code,
-            lastErrorKst=_now_kst(),
-        )
+        total_elapsed = round(time.perf_counter() - t0_perf, 3)
+        err_data: Dict[str, Any] = {
+            "status": "FAILED",
+            "lastStage": err_stage,
+            "errorCode": err_code,
+            "lastErrorKst": _now_kst(),
+            "stageTimings": stage_timings,
+            "totalElapsedSeconds": total_elapsed,
+        }
+        if snap_meta is not None:
+            err_data["localSnapshot"] = snap_meta
+            err_data["local"] = {
+                "status": "SUCCESS",
+                "stage": "COMPLETE",
+                "messageCount": snap_meta.get("messageCount", 0),
+            }
+            err_data["mirror"] = {
+                "status": "FAILED",
+                "stage": err_stage,
+                "errorCode": err_code,
+            }
+        else:
+            err_data["local"] = {
+                "status": "FAILED",
+                "stage": err_stage,
+                "errorCode": err_code,
+            }
+            err_data["mirror"] = {
+                "status": "SKIPPED",
+            }
+
+        state.update(**err_data)
         raise MirrorPipelineError(err_stage, err_code) from None
     finally:
         if vps_ssh_target and vps_remote_dir:
@@ -1175,6 +1375,11 @@ def sync_mirror(
                     snapshot_file.unlink()
                 except OSError:
                     pass
+        if snapshot_gz and snapshot_gz.exists():
+            try:
+                snapshot_gz.unlink()
+            except OSError:
+                pass
         if local_meta_file and local_meta_file.exists():
             try:
                 local_meta_file.unlink()

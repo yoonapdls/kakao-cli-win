@@ -960,14 +960,15 @@ Write-Host "Sync completed successfully"
         self.assertTrue(any("rm -f" in c and ".partial" in c for c in commands_run_to))
 
     def test_cleanup_failure_preserves_current(self):
-        """Verify that cleanup failure never triggers current replacement (current is preserved)."""
-        # Case A: Verification succeeds, but remote meta cleanup fails (returns code != 0 or raises)
+        """Verify that replace failure triggers rollback and cleanup, preserving current."""
+        # Case A: Verification succeeds, but remote replace (which integrates meta cleanup) fails
         commands_run_a = []
 
-        def mock_ssh_meta_cleanup_fail(ssh_cmd, remote_cmd):
+        def mock_ssh_replace_fail(ssh_cmd, remote_cmd):
             commands_run_a.append(remote_cmd)
-            if "rm -f" in remote_cmd and ".verify_" in remote_cmd:
-                return 1, "", "rm failed"
+            # Fail the replace command (which starts with rm -f .verify_)
+            if "mv -f" in remote_cmd and "messages_v2.sqlite" in remote_cmd:
+                return 1, "", "replace command failed"
             return 0, "", ""
 
         def mock_download_runner_ok(scp_cmd, remote_src, local_dest):
@@ -986,22 +987,23 @@ Write-Host "Sync completed successfully"
                 stop_file=self.stop_file,
                 vps_ssh_target="user@test.vps",
                 vps_remote_dir="/var/data/kakao",
-                ssh_runner=mock_ssh_meta_cleanup_fail,
+                ssh_runner=mock_ssh_replace_fail,
                 upload_runner=lambda *a: (0, "", ""),
                 download_runner=mock_download_runner_ok,
             )
 
-        self.assertEqual(ctx_a.exception.error_code, "CLEANUP_FAILED")
-        self.assertEqual(ctx_a.exception.stage, "REMOTE_VERIFY")
-        # mv -f messages_v2.sqlite must NEVER be called
-        self.assertFalse(any("mv -f" in c and "messages_v2.sqlite" in c for c in commands_run_a))
+        self.assertEqual(ctx_a.exception.error_code, "REPLACE_FAILED")
+        self.assertEqual(ctx_a.exception.stage, "REMOTE_REPLACE")
+        # Ensure rollback and cleanup were called
+        self.assertTrue(any(".rollback" in c for c in commands_run_a), "Rollback must be attempted on replace failure")
+        self.assertTrue(any(".verify_" in c and "rm -f" in c for c in commands_run_a), "Verify meta cleanup must be executed")
 
         # Case B: Verification fails (count mismatch), and subsequent _cleanup_remote raises an exception
         commands_run_b = []
 
         def mock_ssh_cleanup_throws(ssh_cmd, remote_cmd):
             commands_run_b.append(remote_cmd)
-            if "rm -f" in remote_cmd:
+            if "rm -f" in remote_cmd and "gzip" not in remote_cmd:
                 raise RuntimeError("SSH connection lost during cleanup")
             return 0, "", ""
 
@@ -2177,6 +2179,470 @@ Write-Host "Sync completed successfully"
         self.assertIn("messages_v2.sqlite.prev", rep, "Replace script must preserve previous copy as .prev")
         self.assertIn("10000:10000", rep)
         self.assertIn("600", rep)
+
+
+    def test_gzip_compression_savings_and_decompression_integrity(self):
+        """Verify gzip compression reduces database size and decompresses with byte-for-byte SHA-256 match."""
+        snap_path = self.snapshot_dir / "messages_v2_snapshot.sqlite"
+        mirror.create_readonly_snapshot(self.src_db, snap_path)
+        raw_size = snap_path.stat().st_size
+        raw_sha = mirror.compute_sha256(snap_path)
+
+        gz_path = self.snapshot_dir / "messages_v2_snapshot.sqlite.gz"
+        comp_meta = mirror.compress_file_gzip(snap_path, gz_path)
+
+        self.assertTrue(gz_path.exists())
+        self.assertLess(comp_meta["sizeBytes"], raw_size)
+        self.assertEqual(comp_meta["sizeBytes"], gz_path.stat().st_size)
+
+        # Decompress and verify SHA-256
+        import gzip
+        decompressed_data = gzip.decompress(gz_path.read_bytes())
+        import hashlib
+        decomp_sha = hashlib.sha256(decompressed_data).hexdigest()
+        self.assertEqual(decomp_sha, raw_sha)
+
+    def test_mirror_pipeline_gzip_upload_and_decompression_success(self):
+        """Verify mirror pipeline compresses locally, uploads .gz, decompresses remotely into .partial, and verifies."""
+        uploaded_files = []
+        commands_run = []
+
+        def mock_upload(scp_cmd, local_p, remote_dst):
+            uploaded_files.append((str(local_p), remote_dst))
+            self.assertTrue(str(local_p).endswith(".gz"), f"Uploaded local file must be .gz: {local_p}")
+            self.assertTrue(remote_dst.endswith(".gz"), f"Remote dest must be .gz: {remote_dst}")
+            return 0, "", ""
+
+        def mock_ssh(ssh_cmd, remote_cmd, timeout=None):
+            commands_run.append(remote_cmd)
+            return 0, "", ""
+
+        def mock_download(scp_cmd, remote_src, local_dest):
+            snap_path = self.snapshot_dir / "messages_v2_snapshot.sqlite"
+            actual_sha = mirror.compute_sha256(snap_path)
+            content = json.dumps({
+                "integrityCheck": "ok",
+                "messageCount": 3,
+                "minSentAtIso": "2023-11-14T22:13:20",
+                "maxSentAtIso": "2023-11-14T22:13:40",
+                "sha256": actual_sha,
+                "sizeBytes": snap_path.stat().st_size,
+            })
+            Path(local_dest).write_text(content, encoding="utf-8")
+            return 0, "", ""
+
+        res = mirror.sync_mirror(
+            src_db=self.src_db,
+            snapshot_dir=self.snapshot_dir,
+            state_file=self.state_file,
+            lock_file=self.lock_file,
+            stop_file=self.stop_file,
+            vps_ssh_target="user@test.vps",
+            vps_remote_dir="/var/data/kakao",
+            ssh_runner=mock_ssh,
+            upload_runner=mock_upload,
+            download_runner=mock_download,
+        )
+
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(len(uploaded_files), 1)
+        self.assertTrue(uploaded_files[0][0].endswith("messages_v2_snapshot.sqlite.gz"))
+        self.assertTrue(uploaded_files[0][1].endswith("messages_v2.sqlite.partial.gz"))
+
+        # Check remote decompression was executed
+        decompress_cmds = [c for c in commands_run if "REMOTE_DECOMPRESS" in c or "gzip" in c or "decompress" in c]
+        self.assertGreaterEqual(len(decompress_cmds), 1, "Remote decompression command must be run")
+
+        # Check remote .gz cleanup was executed
+        gz_cleanup_cmds = [c for c in commands_run if "rm -f" in c and "messages_v2.sqlite.partial.gz" in c]
+        self.assertGreaterEqual(len(gz_cleanup_cmds), 1, "Remote .partial.gz must be cleaned up")
+
+        # Verify no temp files left locally
+        self.assertFalse((self.snapshot_dir / "messages_v2_snapshot.sqlite").exists())
+        self.assertFalse((self.snapshot_dir / "messages_v2_snapshot.sqlite.gz").exists())
+
+    def test_mirror_failure_vps_disk_full(self):
+        """Verify remote disk full (ENOSPC, exit code 28) during decompression fails with DISK_FULL, preserves current, and cleans temp files."""
+        commands_run = []
+
+        def mock_upload(scp_cmd, local_p, remote_dst):
+            return 0, "", ""
+
+        def mock_ssh(ssh_cmd, remote_cmd, timeout=None):
+            commands_run.append(remote_cmd)
+            # Fail decompression with exit code 28 (ENOSPC)
+            if "messages_v2.sqlite.partial.gz" in remote_cmd and ("gzip" in remote_cmd or "decompress" in remote_cmd or "copyfileobj" in remote_cmd):
+                return 28, "", "No space left on device"
+            return 0, "", ""
+
+        with self.assertRaises(mirror.MirrorPipelineError) as ctx:
+            mirror.sync_mirror(
+                src_db=self.src_db,
+                snapshot_dir=self.snapshot_dir,
+                state_file=self.state_file,
+                lock_file=self.lock_file,
+                stop_file=self.stop_file,
+                vps_ssh_target="user@test.vps",
+                vps_remote_dir="/var/data/kakao",
+                ssh_runner=mock_ssh,
+                upload_runner=mock_upload,
+            )
+
+        self.assertEqual(ctx.exception.stage, "REMOTE_DECOMPRESS")
+        self.assertEqual(ctx.exception.error_code, "DISK_FULL")
+
+        # Verify cleanup of partial and partial.gz was run
+        cleanup_cmds = [c for c in commands_run if "rm -f" in c]
+        self.assertTrue(any("messages_v2.sqlite.partial.gz" in c for c in cleanup_cmds), "Must clean up remote .partial.gz")
+        self.assertTrue(any("messages_v2.sqlite.partial" in c for c in cleanup_cmds), "Must clean up remote .partial")
+
+        # Atomic replace must NOT be run
+        self.assertFalse(any("mv -f" in c and "messages_v2.sqlite" in c for c in commands_run))
+
+    def test_mirror_failure_local_compression_failed(self):
+        """Verify local compression failure raises COMPRESS_FAILED, cleans local temp files, and leaves remote untouched."""
+        def mock_bad_compress(src, dst):
+            raise mirror.MirrorPipelineError("LOCAL_COMPRESS", "COMPRESS_FAILED")
+
+        with unittest.mock.patch("kwin.mirror.compress_file_gzip", side_effect=mock_bad_compress):
+            with self.assertRaises(mirror.MirrorPipelineError) as ctx:
+                mirror.sync_mirror(
+                    src_db=self.src_db,
+                    snapshot_dir=self.snapshot_dir,
+                    state_file=self.state_file,
+                    lock_file=self.lock_file,
+                    stop_file=self.stop_file,
+                    vps_ssh_target="user@test.vps",
+                    vps_remote_dir="/var/data/kakao",
+                )
+
+        self.assertEqual(ctx.exception.stage, "LOCAL_COMPRESS")
+        self.assertEqual(ctx.exception.error_code, "COMPRESS_FAILED")
+
+        # Verify local temp files cleaned up
+        self.assertFalse((self.snapshot_dir / "messages_v2_snapshot.sqlite").exists())
+        self.assertFalse((self.snapshot_dir / "messages_v2_snapshot.sqlite.gz").exists())
+
+    def test_mirror_failure_remote_decompression_corrupt_gzip(self):
+        """Verify decompression failure (exit code 1) triggers DECOMPRESS_FAILED and cleans up remote partials."""
+        commands_run = []
+
+        def mock_ssh(ssh_cmd, remote_cmd, timeout=None):
+            commands_run.append(remote_cmd)
+            if "messages_v2.sqlite.partial.gz" in remote_cmd and ("gzip" in remote_cmd or "decompress" in remote_cmd or "copyfileobj" in remote_cmd):
+                return 1, "", "gzip: stdin: invalid compressed data"
+            return 0, "", ""
+
+        with self.assertRaises(mirror.MirrorPipelineError) as ctx:
+            mirror.sync_mirror(
+                src_db=self.src_db,
+                snapshot_dir=self.snapshot_dir,
+                state_file=self.state_file,
+                lock_file=self.lock_file,
+                stop_file=self.stop_file,
+                vps_ssh_target="user@test.vps",
+                vps_remote_dir="/var/data/kakao",
+                ssh_runner=mock_ssh,
+                upload_runner=lambda scp, lp, rd: (0, "", ""),
+            )
+
+        self.assertEqual(ctx.exception.stage, "REMOTE_DECOMPRESS")
+        self.assertEqual(ctx.exception.error_code, "DECOMPRESS_FAILED")
+
+        # Cleanups executed
+        cleanup_cmds = [c for c in commands_run if "rm -f" in c]
+        self.assertTrue(any("messages_v2.sqlite.partial.gz" in c for c in cleanup_cmds))
+        self.assertTrue(any("messages_v2.sqlite.partial" in c for c in cleanup_cmds))
+
+    def test_mirror_failure_sha256_mismatch_after_decompression(self):
+        """Verify decompressed remote candidate hash mismatch against original uncompressed snapshot fails at REMOTE_VERIFY:HASH_MISMATCH."""
+        commands_run = []
+
+        def mock_download(scp_cmd, remote_src, local_dest):
+            content = json.dumps({
+                "integrityCheck": "ok",
+                "messageCount": 3,
+                "minSentAtIso": "2023-11-14T22:13:20",
+                "maxSentAtIso": "2023-11-14T22:13:40",
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "sizeBytes": (self.snapshot_dir / "messages_v2_snapshot.sqlite").stat().st_size,
+            })
+            Path(local_dest).write_text(content, encoding="utf-8")
+            return 0, "", ""
+
+        def mock_ssh(ssh_cmd, remote_cmd, timeout=None):
+            commands_run.append(remote_cmd)
+            return 0, "", ""
+
+        with self.assertRaises(mirror.MirrorPipelineError) as ctx:
+            mirror.sync_mirror(
+                src_db=self.src_db,
+                snapshot_dir=self.snapshot_dir,
+                state_file=self.state_file,
+                lock_file=self.lock_file,
+                stop_file=self.stop_file,
+                vps_ssh_target="user@test.vps",
+                vps_remote_dir="/var/data/kakao",
+                ssh_runner=mock_ssh,
+                upload_runner=lambda scp, lp, rd: (0, "", ""),
+                download_runner=mock_download,
+            )
+
+        self.assertEqual(ctx.exception.stage, "REMOTE_VERIFY")
+        self.assertEqual(ctx.exception.error_code, "HASH_MISMATCH")
+
+        # Replace never called, partial cleanup called
+        self.assertFalse(any("mv -f" in c and "messages_v2.sqlite" in c for c in commands_run))
+        self.assertTrue(any("rm -f" in c and "messages_v2.sqlite.partial" in c for c in commands_run))
+
+    def test_mirror_monotonic_deadline_budget_and_timeout(self):
+        """Verify stages use remaining monotonic deadline budget and do not stack fixed timeouts exceeding total deadline."""
+        recorded_timeouts = []
+
+        def mock_ssh(ssh_cmd, remote_cmd, timeout=None):
+            if timeout is not None:
+                recorded_timeouts.append((remote_cmd[:30], timeout))
+            return 0, "", ""
+
+        def mock_upload(scp_cmd, local_p, remote_dst, timeout=None):
+            if timeout is not None:
+                recorded_timeouts.append(("upload", timeout))
+            return 0, "", ""
+
+        def mock_download(scp_cmd, remote_src, local_dest, timeout=None):
+            snap_path = self.snapshot_dir / "messages_v2_snapshot.sqlite"
+            actual_sha = mirror.compute_sha256(snap_path)
+            content = json.dumps({
+                "integrityCheck": "ok",
+                "messageCount": 3,
+                "minSentAtIso": "2023-11-14T22:13:20",
+                "maxSentAtIso": "2023-11-14T22:13:40",
+                "sha256": actual_sha,
+                "sizeBytes": snap_path.stat().st_size,
+            })
+            Path(local_dest).write_text(content, encoding="utf-8")
+            return 0, "", ""
+
+        # Test 1: total_deadline_sec=5 binds stage timeouts to <= 5s
+        res = mirror.sync_mirror(
+            src_db=self.src_db,
+            snapshot_dir=self.snapshot_dir,
+            state_file=self.state_file,
+            lock_file=self.lock_file,
+            stop_file=self.stop_file,
+            vps_ssh_target="user@test.vps",
+            vps_remote_dir="/var/data/kakao",
+            ssh_runner=mock_ssh,
+            upload_runner=mock_upload,
+            download_runner=mock_download,
+            total_deadline_sec=5,
+        )
+        self.assertEqual(res["status"], "SUCCESS")
+        for tag, to in recorded_timeouts:
+            self.assertLessEqual(to, 5, f"Stage timeout for {tag} must not exceed remaining deadline 5, got {to}")
+
+        # Test 2: total_deadline_sec=1 with simulated elapsed time triggers TIMEOUT
+        with unittest.mock.patch("time.monotonic", side_effect=[0.0, 0.5, 10.0, 10.5, 11.0]):
+            with self.assertRaises(mirror.MirrorPipelineError) as ctx:
+                mirror.sync_mirror(
+                    src_db=self.src_db,
+                    snapshot_dir=self.snapshot_dir,
+                    state_file=self.state_file,
+                    lock_file=self.lock_file,
+                    stop_file=self.stop_file,
+                    vps_ssh_target="user@test.vps",
+                    vps_remote_dir="/var/data/kakao",
+                    ssh_runner=mock_ssh,
+                    upload_runner=mock_upload,
+                    total_deadline_sec=1,
+                )
+            self.assertEqual(ctx.exception.error_code, "TIMEOUT")
+
+    def test_mirror_state_marker_separates_local_success_and_mirror_failure(self):
+        """Verify mirror_state.json clearly separates local collection/snapshot success and message count from mirror failure."""
+        def mock_upload_fail(scp_cmd, local_p, remote_dst):
+            return 1, "", "upload failed"
+
+        with self.assertRaises(mirror.MirrorPipelineError):
+            mirror.sync_mirror(
+                src_db=self.src_db,
+                snapshot_dir=self.snapshot_dir,
+                state_file=self.state_file,
+                lock_file=self.lock_file,
+                stop_file=self.stop_file,
+                vps_ssh_target="user@test.vps",
+                vps_remote_dir="/var/data/kakao",
+                ssh_runner=lambda c, r, timeout=None: (0, "", ""),
+                upload_runner=mock_upload_fail,
+            )
+
+        state = mirror.StateMarker(self.state_file).read()
+        self.assertEqual(state["status"], "FAILED")
+        self.assertEqual(state["lastStage"], "REMOTE_UPLOAD")
+        self.assertEqual(state["errorCode"], "UPLOAD_FAILED")
+
+        # Local snapshot information is preserved and marked SUCCESS
+        self.assertIn("localSnapshot", state)
+        self.assertEqual(state["localSnapshot"]["messageCount"], 3)
+        self.assertIn("local", state)
+        self.assertEqual(state["local"]["status"], "SUCCESS")
+        self.assertEqual(state["local"]["messageCount"], 3)
+
+        # Mirror information is marked FAILED with specific stage and error code
+        self.assertIn("mirror", state)
+        self.assertEqual(state["mirror"]["status"], "FAILED")
+        self.assertEqual(state["mirror"]["stage"], "REMOTE_UPLOAD")
+        self.assertEqual(state["mirror"]["errorCode"], "UPLOAD_FAILED")
+
+
+    def test_success_path_no_separate_meta_cleanup_ssh_call(self):
+        """Verify that temporary verify meta cleanup is integrated into replace command without a separate SSH call."""
+        commands_run = []
+
+        def mock_ssh(ssh_cmd, remote_cmd, timeout=None):
+            commands_run.append(remote_cmd)
+            return 0, "", ""
+
+        def mock_upload(scp_cmd, local_p, remote_dst, timeout=None):
+            return 0, "", ""
+
+        def mock_download(scp_cmd, remote_src, local_dest, timeout=None):
+            snap_path = self.snapshot_dir / "messages_v2_snapshot.sqlite"
+            actual_sha = mirror.compute_sha256(snap_path)
+            content = f"ok\n3|2023-11-14T22:13:20|2023-11-14T22:13:40\n{actual_sha}"
+            Path(local_dest).write_text(content, encoding="utf-8")
+            return 0, "", ""
+
+        res = mirror.sync_mirror(
+            src_db=self.src_db,
+            snapshot_dir=self.snapshot_dir,
+            state_file=self.state_file,
+            lock_file=self.lock_file,
+            stop_file=self.stop_file,
+            vps_ssh_target="user@test.vps",
+            vps_remote_dir="/var/data/kakao",
+            ssh_runner=mock_ssh,
+            upload_runner=mock_upload,
+            download_runner=mock_download,
+        )
+
+        self.assertEqual(res["status"], "SUCCESS")
+
+        # 1. No standalone SSH command for verify meta cleanup
+        standalone_clean_meta = [
+            c for c in commands_run
+            if "rm -f" in c and ".verify_" in c and ("messages_v2" not in c and "mv -f" not in c)
+        ]
+        self.assertEqual(
+            len(standalone_clean_meta),
+            0,
+            f"Temporary verify meta cleanup must not be executed as a separate SSH command: {standalone_clean_meta}"
+        )
+
+        # 2. Verify meta cleanup is integrated into the replace command
+        replace_cmds = [c for c in commands_run if "mv -f" in c and "messages_v2.sqlite" in c]
+        self.assertEqual(len(replace_cmds), 1, "Exactly one replace command must be executed")
+        self.assertTrue(
+            any(".verify_" in c and "rm -f" in c for c in replace_cmds),
+            f"Replace command must integrate rm -f for temporary verify meta file: {replace_cmds[0]}"
+        )
+
+    def test_all_verify_failure_paths_clean_meta_leaving_zero_residue(self):
+        """Verify that all verification failure paths clean up temporary verify meta file leaving 0 residue."""
+        failure_cases = [
+            ("count_mismatch", f"ok\n999|2023-11-14T22:13:20|2023-11-14T22:13:40\nSHA", "COUNT_MISMATCH"),
+            ("min_mismatch", f"ok\n3|2020-01-01T00:00:00|2023-11-14T22:13:40\nSHA", "MIN_TIMESTAMP_MISMATCH"),
+            ("max_mismatch", f"ok\n3|2023-11-14T22:13:20|2099-01-01T00:00:00\nSHA", "MAX_TIMESTAMP_MISMATCH"),
+            ("hash_mismatch", f"ok\n3|2023-11-14T22:13:20|2023-11-14T22:13:40\n{('f' * 64)}", "HASH_MISMATCH"),
+            ("integrity_bad", f"corrupt\n3|2023-11-14T22:13:20|2023-11-14T22:13:40\nSHA", "INTEGRITY_FAILED"),
+            ("parse_error", "totally-malformed-meta", "PARSE_ERROR"),
+        ]
+
+        snap_path = self.snapshot_dir / "messages_v2_snapshot.sqlite"
+        # Temporarily create snapshot to compute true sha
+        actual_sha = mirror.compute_sha256(self.src_db)
+
+        for case_name, meta_template, expected_err in failure_cases:
+            with self.subTest(case=case_name):
+                commands_run = []
+                meta_content = meta_template.replace("SHA", actual_sha)
+
+                def mock_ssh(ssh_cmd, remote_cmd, timeout=None):
+                    commands_run.append(remote_cmd)
+                    return 0, "", ""
+
+                def mock_upload(scp_cmd, local_p, remote_dst, timeout=None):
+                    return 0, "", ""
+
+                def mock_download(scp_cmd, remote_src, local_dest, timeout=None):
+                    Path(local_dest).write_text(meta_content, encoding="utf-8")
+                    return 0, "", ""
+
+                with self.assertRaises(mirror.MirrorPipelineError) as ctx:
+                    mirror.sync_mirror(
+                        src_db=self.src_db,
+                        snapshot_dir=self.snapshot_dir,
+                        state_file=self.state_file,
+                        lock_file=self.lock_file,
+                        stop_file=self.stop_file,
+                        vps_ssh_target="user@test.vps",
+                        vps_remote_dir="/var/data/kakao",
+                        ssh_runner=mock_ssh,
+                        upload_runner=mock_upload,
+                        download_runner=mock_download,
+                    )
+
+                self.assertEqual(ctx.exception.error_code, expected_err)
+                self.assertEqual(ctx.exception.stage, "REMOTE_VERIFY")
+
+                # Atomic replacement must NEVER be invoked
+                self.assertFalse(
+                    any("mv -f" in c and "messages_v2.sqlite" in c for c in commands_run),
+                    "Atomic replacement must never be executed on verification failure"
+                )
+
+                # Cleanup command must be called and must include both .partial and .verify_ (0 residue)
+                cleanup_cmds = [c for c in commands_run if "rm -f" in c]
+                self.assertTrue(
+                    any(".partial" in c and ".verify_" in c for c in cleanup_cmds),
+                    f"Cleanup on failure must clean up both partial and meta file: {cleanup_cmds}"
+                )
+
+    def test_transient_clean_meta_timeout_eliminated_by_integration(self):
+        """Verify that the production incident (30s timeout on separate clean_meta SSH call) is eliminated."""
+        commands_run = []
+
+        def mock_ssh(ssh_cmd, remote_cmd, timeout=None):
+            commands_run.append(remote_cmd)
+            # In old implementation: standalone clean_meta_cmd was called here and timed out
+            if "rm -f" in remote_cmd and ".verify_" in remote_cmd and ("messages_v2" not in remote_cmd and "mv -f" not in remote_cmd):
+                raise subprocess.TimeoutExpired(cmd=ssh_cmd, timeout=30)
+            return 0, "", ""
+
+        def mock_upload(scp_cmd, local_p, remote_dst, timeout=None):
+            return 0, "", ""
+
+        def mock_download(scp_cmd, remote_src, local_dest, timeout=None):
+            snap_path = self.snapshot_dir / "messages_v2_snapshot.sqlite"
+            actual_sha = mirror.compute_sha256(snap_path)
+            content = f"ok\n3|2023-11-14T22:13:20|2023-11-14T22:13:40\n{actual_sha}"
+            Path(local_dest).write_text(content, encoding="utf-8")
+            return 0, "", ""
+
+        # In old code: raised MirrorPipelineError("REMOTE_VERIFY", "TIMEOUT")
+        res = mirror.sync_mirror(
+            src_db=self.src_db,
+            snapshot_dir=self.snapshot_dir,
+            state_file=self.state_file,
+            lock_file=self.lock_file,
+            stop_file=self.stop_file,
+            vps_ssh_target="user@test.vps",
+            vps_remote_dir="/var/data/kakao",
+            ssh_runner=mock_ssh,
+            upload_runner=mock_upload,
+            download_runner=mock_download,
+        )
+        self.assertEqual(res["status"], "SUCCESS")
 
 
 if __name__ == "__main__":
